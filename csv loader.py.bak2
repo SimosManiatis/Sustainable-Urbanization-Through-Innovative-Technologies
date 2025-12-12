@@ -1,0 +1,337 @@
+﻿import os
+import glob
+import json
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from datetime import datetime, timedelta
+
+RAW_DATA_DIR = r'D:\JEOIT\raw_data'
+MAPPING_FILE = r'D:\JEOIT\sensor_mapping.json'
+
+def find_latest_csv(directory):
+    """Finds the latest CSV file in the given directory."""
+    list_of_files = glob.glob(os.path.join(directory, '*.csv'))
+    if not list_of_files:
+        return None
+    return max(list_of_files, key=os.path.getctime)
+
+
+def load_mapping():
+    """Loads the sensor mapping from JSON.
+       Returns:
+         measurements_map: dict of {Label: UUID}
+         uuid_to_label: dict of {UUID: Label}
+         locations_map: dict of {SensorName: LocationName}
+    """
+    if os.path.exists(MAPPING_FILE):
+        try:
+            with open(MAPPING_FILE, "r") as f:
+                data = json.load(f)
+                
+                # Handle new structure
+                if "measurements" in data:
+                    mapping = data.get("measurements", {})
+                    locations = data.get("locations", {})
+                else:
+                    # Legacy structure (fallback)
+                    mapping = data
+                    locations = {}
+                    
+                id_to_label = {v: k for k, v in mapping.items()}
+                return mapping, id_to_label, locations
+        except Exception as e:
+            print(f"Error loading mapping file: {e}")
+            return {}, {}, {}
+    return {}, {}, {}
+
+def get_unique_sensors(df, sensor_name_col):
+    """Returns sorted list of unique sensor names."""
+    if sensor_name_col and sensor_name_col in df.columns:
+        return sorted(df[sensor_name_col].astype(str).unique())
+    return []
+
+def filter_by_time(df, time_option):
+    """Filters dataframe based on time option."""
+    if time_option == "all":
+        return df
+    
+    # Ensure SendDate is datetime
+    if not pd.api.types.is_datetime64_any_dtype(df["SendDate"]):
+        df["SendDate"] = pd.to_datetime(df["SendDate"], errors="coerce")
+        
+    max_date = df["SendDate"].max()
+    if pd.isna(max_date):
+        return df
+        
+    start_date = None
+    
+    if time_option == "24h":
+        start_date = max_date - timedelta(hours=24)
+    elif time_option == "7d":
+        start_date = max_date - timedelta(days=7)
+    elif time_option == "custom":
+        print(f"\nData range available: {df["SendDate"].min().date()} to {max_date.date()}")
+        print("Please enter dates in YYYY-MM-DD format.")
+        
+        while True:
+            start_str = input("Start Date (e.g. 2025-12-01): ").strip()
+            if not start_str:
+                print("Start date is required.")
+                continue
+            try:
+                start_date = pd.to_datetime(start_str)
+                break
+            except ValueError:
+                print("Invalid format. Try again.")
+                
+        end_str = input("End Date (Leave empty for latest): ").strip()
+        if end_str:
+            try:
+                end_date_val = pd.to_datetime(end_str)
+                end_date_val = end_date_val + timedelta(days=1) - timedelta(microseconds=1)
+                return df[(df["SendDate"] >= start_date) & (df["SendDate"] <= end_date_val)]
+            except ValueError:
+                print("Invalid end date format. Using max date.")
+                
+        return df[df["SendDate"] >= start_date]
+
+    if start_date:
+        return df[df["SendDate"] >= start_date]
+        
+    return df
+
+def plot_sensor_data(df, sensor_name, sensor_name_col, target_label, target_id, time_option, period_option, location_name=""):
+    """Plots Value vs SendDate for the specific sensor and data type."""
+    print(f"\nPreparing to plot ""{target_label}"" for ""{sensor_name}""...")
+    
+    # Filter by Sensor Name
+    mask = (df[sensor_name_col] == sensor_name)
+    
+    # Filter by Sensor ID
+    mask &= (df["SensorId"].astype(str) == str(target_id))
+    
+    subset = df[mask].copy()
+    
+    if subset.empty:
+        print("No data found for this combination.")
+        return
+
+    # Process Dates
+    print("Processing dates...")
+    subset["SendDate"] = pd.to_datetime(subset["SendDate"], errors="coerce")
+    subset = subset.dropna(subset=["SendDate"])
+    
+    # STRICT SORTING
+    subset = subset.sort_values("SendDate")
+    
+    # Filter by Time
+    subset = filter_by_time(subset, time_option)
+    
+    if subset.empty:
+        print("No data found for the selected time range.")
+        return
+
+    # RESAMPLING / PERIOD
+    if period_option and period_option != "none":
+        print(f"Applying period resampling: {period_option}...")
+        
+        subset = subset.set_index("SendDate")
+        
+        # Ensure Value is numeric
+        subset["Value"] = pd.to_numeric(subset["Value"], errors="coerce")
+        
+        # Resample ONLY the Value column
+        resampled = subset["Value"].resample(period_option).mean()
+        
+        # IMPORTANT: Do NOT dropna() here if we want gaps to appear as breaks.
+        subset = resampled.reset_index()
+
+
+    # Visualize
+    print(f"Plotting {len(subset)} data points...")
+    
+    # Styling Constants
+    color_line = "#000080"
+    color_fill = "#ADD8E6"
+
+    # Check if empty (all NaNs?)
+    if subset["Value"].dropna().empty:
+        print("No valid data points to plot after processing.")
+        return
+
+    start_date_str = subset["SendDate"].min().strftime("%Y-%m-%d")
+    end_date_str = subset["SendDate"].max().strftime("%Y-%m-%d")
+    date_range_str = f"{start_date_str} / {end_date_str}"
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    # 1. Main Plot
+    ax.plot(subset["SendDate"], subset["Value"], color=color_line, linewidth=2)
+    ax.fill_between(subset["SendDate"], subset["Value"], color=color_fill, alpha=0.3)
+    
+    # 2. Remove Axes Spines
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_visible(False)
+    ax.spines["bottom"].set_color("#E0E0E0") 
+    
+    # 3. Y-Axis Cleanup
+    ax.yaxis.set_visible(False)
+    ax.grid(False)
+
+    # 4. Custom Title Block (Top Left)
+    title_text = f"{sensor_name} - {location_name}" if location_name else sensor_name
+    ax.text(0.0, 1.10, title_text, transform=ax.transAxes, fontsize=16, fontweight="bold", color="black", ha="left")
+    ax.text(0.0, 1.05, target_label, transform=ax.transAxes, fontsize=12, color="gray", ha="left")
+    ax.text(0.0, 1.00, date_range_str, transform=ax.transAxes, fontsize=10, color="gray", ha="left")
+    
+    # 5. X-Axis Cleanup
+    ax.tick_params(axis="x", colors="gray")
+
+    plt.tight_layout()
+    plt.subplots_adjust(top=0.85) 
+    
+    plt.show()
+    print("Plot display request sent.")
+
+def interactive_menu(df, label_to_id, locations_map):
+    """Runs the interactive selection menu."""
+    
+    sensor_name_col = None
+    text_cols = df.select_dtypes(include=["object"]).columns
+    for col in text_cols:
+        sample_vals = df[col].dropna().head(1000).unique()
+        if any("TRP" in str(v) for v in sample_vals):
+            sensor_name_col = col
+            break
+            
+    if not sensor_name_col:
+        print("Could not identify Sensor Name column.")
+        return
+
+    while True:
+        print("\n" + "="*50)
+        print("INTERACTIVE PLOTTING MENU")
+        print("="*50)
+        
+        sensors = get_unique_sensors(df, sensor_name_col)
+        print("\nAvailable Sensors:")
+        for i, s in enumerate(sensors):
+            loc = locations_map.get(s, "")
+            display_name = f"{s} ({loc})" if loc else s
+            print(f"{i+1}. {display_name}")
+        print("x. Exit")
+        
+        choice = input("\nSelect Sensor (number): ")
+        if choice.lower() == "x":
+            break
+            
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(sensors):
+                selected_sensor = sensors[idx]
+            else:
+                print("Invalid selection.")
+                continue
+        except ValueError:
+            print("Invalid input.")
+            continue
+            
+        # Select Data Type
+        sensor_data = df[df[sensor_name_col] == selected_sensor]
+        present_ids = set(sensor_data["SensorId"].astype(str).unique())
+        available_labels = [label for label, sid in label_to_id.items() if sid in present_ids]
+        available_labels.sort()
+        
+        print(f"\nAvailable Data Types for {selected_sensor}:")
+        for i, label in enumerate(available_labels):
+            print(f"{i+1}. {label}")
+        print("b. Back")
+        
+        choice = input("\nSelect Data Type (number): ")
+        if choice.lower() == "b":
+            continue
+            
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(available_labels):
+                selected_label = available_labels[idx]
+                selected_id = label_to_id[selected_label]
+            else:
+                print("Invalid selection.")
+                continue
+        except ValueError:
+            print("Invalid input.")
+            continue
+
+        # Select Time Span
+        print("\nSelect Time Span:")
+        print("1. All Time")
+        print("2. Last 24 Hours")
+        print("3. Last 7 Days")
+        print("4. Custom Range")
+        
+        time_choice = input("\nSelect Time Option (number): ")
+        time_option = "all"
+        
+        if time_choice == "2":
+            time_option = "24h"
+        elif time_choice == "3":
+            time_option = "7d"
+        elif time_choice == "4":
+            time_option = "custom"
+            
+        # Select Period
+        print("\nSelect Period (Resampling):")
+        print("1. None (Raw Data)")
+        print("2. Quarter Hour (15 min)")
+        print("3. Half Hour (30 min)")
+        print("4. Hour")
+        print("5. Day")
+        print("6. Month")
+        print("7. Year")
+        
+        period_choice = input("\nSelect Period Option (number): ")
+        period_option = "none"
+        
+        aliases = {
+            "2": "15min",
+            "3": "30min",
+            "4": "1h",
+            "5": "1D",
+            "6": "1ME",
+            "7": "1YE"
+        }
+        
+        if period_choice in aliases:
+            period_option = aliases[period_choice]
+        
+        loc_name = locations_map.get(selected_sensor, "")
+        plot_sensor_data(df, selected_sensor, sensor_name_col, selected_label, selected_id, time_option, period_option, location_name=loc_name)
+
+def main():
+    if not os.path.exists(RAW_DATA_DIR):
+        print(f"Error: Directory not found: {RAW_DATA_DIR}")
+        return
+
+    mapping_data, id_to_label, locations = load_mapping()
+    if not mapping_data:
+        print("Mapping file missing or empty.")
+        return
+
+    latest_csv = find_latest_csv(RAW_DATA_DIR)
+    
+    if latest_csv:
+        print(f"Reading file: {os.path.basename(latest_csv)}...")
+        try:
+             df = pd.read_csv(latest_csv, low_memory=False)
+             interactive_menu(df, mapping_data, locations)
+        except Exception as e:
+            print(f"Error: {e}")
+    else:
+        print("No CSV files found.")
+
+if __name__ == "__main__":
+    main()
+
