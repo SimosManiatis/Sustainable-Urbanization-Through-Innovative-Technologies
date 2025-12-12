@@ -1,10 +1,145 @@
 import pandas as pd
 import numpy as np
 from datetime import timedelta
-from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import silhouette_score
 from .utils import print_header, print_info, print_warning, print_success, Colors
+
+# Try importing sklearn
+try:
+    from sklearn.cluster import KMeans
+    from sklearn.metrics import silhouette_score
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+
+
+def get_feature_columns(df):
+    """Returns columns containing 'norm_' (Wide Format: Measurement_norm_Feature)."""
+    return [c for c in df.columns if 'norm_' in c]
+
+
+def find_optimal_k_global(df, max_k=10):
+    """
+    Runs K-Means sweep on the global dataset (wide format).
+    Returns metrics to help decide K.
+    """
+    if not SKLEARN_AVAILABLE:
+        print_warning("Scikit-learn required for clustering.")
+        return None, None, None
+
+    feature_cols = get_feature_columns(df)
+    if not feature_cols:
+        print_warning("No normalized features (norm_*) found for clustering.")
+        return None, None, None
+
+    X = df[feature_cols].dropna()
+    if len(X) < 50:
+        print_warning("Not enough data points for clustering.")
+        return None, None, None
+
+    print_info("Optimization", f"Sweeping K=2..{max_k} on {len(feature_cols)} features...")
+    
+    inertia_values = []
+    silhouette_values = []
+    k_range = range(2, min(max_k + 1, len(X)))
+    
+    for k in k_range:
+        kmeans = KMeans(n_clusters=k, random_state=42, n_init='auto')
+        labels = kmeans.fit_predict(X)
+        
+        inertia = kmeans.inertia_
+        # Silhouette can be slow on large data, sample if needed
+        sil = silhouette_score(X, labels, sample_size=5000) 
+        
+        inertia_values.append(inertia)
+        silhouette_values.append(sil)
+        print(f"  -> k={k}: Inertia={inertia:.1f}, Silhouette={sil:.3f}")
+        
+    return k_range, inertia_values, silhouette_values
+
+
+def perform_global_clustering(df, n_clusters=4):
+    """
+    Performs global K-Means clustering on the wide DataFrame.
+    """
+    if not SKLEARN_AVAILABLE:
+        return df, None, {}
+
+    feature_cols = get_feature_columns(df)
+    if not feature_cols:
+        return df, None, {}
+
+    # We need to cluster on valid rows only, but return a DF with Cluster ID matching original indices
+    # Drop NAs for fitting
+    data_to_fit = df.dropna(subset=feature_cols)
+    X = data_to_fit[feature_cols]
+
+    print_info("Clustering", f"Fitting KMeans (K={n_clusters}) on {len(X)} samples...")
+    
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    clusters = kmeans.fit_predict(X)
+    
+    # Assign back to a copy of the original DF
+    result_df = df.copy()
+    result_df['Cluster'] = np.nan
+    # Align indices
+    result_df.loc[data_to_fit.index, 'Cluster'] = clusters
+    
+    # Fill NaN clusters? No, keep as NaN (these were dropped rows)
+    # Cast to Int (nullable)
+    result_df['Cluster'] = result_df['Cluster'].astype("Int64")
+
+    # Centroids
+    centroids = pd.DataFrame(kmeans.cluster_centers_, columns=feature_cols)
+
+    # Activity Labeling
+    # Logic: Calculate "Magnitude" of each cluster centroid (mean absolute Z-score)
+    # Higher magnitude usually means more deviation from mean (active) if norm is robust.
+    # Alternatively: Check magnitude of 'std' or 'delta' features specifically if they exist.
+    # Let's use mean of all norm features for now, assuming they represent "activity/variance".
+    
+    # Better heuristic: 
+    # Usually "Inactive" = Low variance (low std), Low change (low delta).
+    # Since we normalized, Inactive might be negative Z-score (below average variability)? 
+    # Or near 0 if average is inactive?
+    # Actually, Z-score 0 is the Mean.
+    # If the dataset is mostly inactive, Mean might be "Low Activity".
+    # High Z-score = High Activity.
+    # Low Z-score (negative) = Very stable?
+    
+    # Let's sum the centroids' values (assuming features are "amount of variation").
+    # If features are just "Temperature Mean", then high != active.
+    # But user said "Activity-state inference". 
+    # Features: "ValueUsed_mean" (raw value?), "std_5min", "delta_15min".
+    # We normalized ALL of them.
+    # We should focus on *variability* features for activity labeling.
+    var_cols = [c for c in feature_cols if 'std' in c or 'delta' in c]
+    if not var_cols: var_cols = feature_cols # Fallback
+    
+    # Calculate magnitude based on variability features
+    centroid_activity_score = centroids[var_cols].mean(axis=1)
+    
+    # Sort clusters by score
+    sorted_map = centroid_activity_score.sort_values().index.tolist()
+    
+    label_map = {}
+    labels = ["Inactive", "Low Activity", "Medium Activity", "High Activity", "Very High Activity"]
+    
+    # Distribute labels
+    # If K=4, map to Inactive, Low, Medium, High
+    # If K=3, Inactive, Medium, High
+    
+    step = len(labels) / n_clusters
+    for i, cluster_id in enumerate(sorted_map):
+        # Pick label
+        label_idx = int(i * step)
+        label_name = labels[min(label_idx, len(labels)-1)]
+        label_map[cluster_id] = label_name
+
+    result_df['ActivityLabel'] = result_df['Cluster'].map(label_map)
+    
+    print_success(f"Clustering complete. Mapped {n_clusters} clusters to activity labels.")
+    
+    return result_df, centroids, label_map
 
 # Try importing sklearn
 try:

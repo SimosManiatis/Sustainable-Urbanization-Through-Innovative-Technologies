@@ -12,55 +12,26 @@ def load_mapping():
             with open(MAPPING_FILE, 'r') as f:
                 mapping_data = json.load(f)
             
-            # Robust JSON handling
-            if isinstance(mapping_data, dict):
-                # Try to extract list if wrapped
-                if "sensors" in mapping_data and isinstance(mapping_data["sensors"], list):
-                     mapping_data = mapping_data["sensors"]
-                elif all(isinstance(v, dict) for v in mapping_data.values()):
-                     print_info("Mapping Format", "Dictionary detected, converting to list.")
-                     mapping_data = list(mapping_data.values())
-                else:
-                     # Check values for a list
-                     found = False
-                     for k, v in mapping_data.items():
-                         if isinstance(v, list):
-                             mapping_data = v
-                             found = True
-                             break
-                     if not found:
-                         print_warning("Unknown JSON structure. Expected list or dict of sensors.")
-
-            # Create helper maps
             id_to_label = {}
             locations = {}
-            
-            # Ensure we iterate a list
-            if not isinstance(mapping_data, list):
-                print_warning("Mapping data is not a list after parsing.")
-                mapping_data = []
 
-            for item in mapping_data:
-                # Items should be dicts
-                if not isinstance(item, dict):
-                    continue
-                
-                sid = item.get('SensorId')
-                label = item.get('Label')
-                loc = item.get('Location')
-                
-                if sid is not None and label:
+            # Handle "measurements": {"Label": "ID"} -> Need ID: Label
+            if "measurements" in mapping_data and isinstance(mapping_data["measurements"], dict):
+                for label, sid in mapping_data["measurements"].items():
                     id_to_label[str(sid)] = label
-                if label and loc:
-                     locations[label] = loc
+            
+            # Handle "locations": {"NodeId": "LocationName"}
+            if "locations" in mapping_data and isinstance(mapping_data["locations"], dict):
+                locations = mapping_data["locations"]
             
             return mapping_data, id_to_label, locations
+
         except json.JSONDecodeError:
             print_error("Mapping file is invalid JSON.")
-            return [], {}, {}
+            return {}, {}, {}
     else:
         print_warning(f"Mapping file not found at {MAPPING_FILE}")
-        return [], {}, {}
+        return {}, {}, {}
 
 def find_latest_csv(directory):
     """Finds the latest CSV file in the directory."""
@@ -81,16 +52,28 @@ def load_raw_data():
 
     mapping_data, id_to_label, locations = load_mapping()
     
-    latest_csv = find_latest_csv(RAW_DATA_DIR)
+    csv_files = glob.glob(os.path.join(RAW_DATA_DIR, '*.csv'))
     
-    if latest_csv:
-        print(f"Reading file: {Colors.BOLD}{os.path.basename(latest_csv)}{Colors.ENDC}...")
-        try:
-             df = pd.read_csv(latest_csv, low_memory=False)
-             return df, id_to_label, locations
-        except Exception as e:
-            print_error(f"Error reading CSV: {e}")
-            return None, None, None
+    if csv_files:
+        print(f"Found {len(csv_files)} CSV files. Reading and concatenating...")
+        dfs = []
+        for file in csv_files:
+            try:
+                # Read only necessary columns to save memory if possible, but user asked to filter LATER.
+                # However, for speed, we might want to read all and filter immediately in preprocessing.
+                # Use low_memory=False to avoid dtypes warning
+                df_chunk = pd.read_csv(file, low_memory=False)
+                dfs.append(df_chunk)
+            except Exception as e:
+                print_error(f"Error reading {os.path.basename(file)}: {e}")
+        
+        if dfs:
+            full_df = pd.concat(dfs, ignore_index=True)
+            return full_df, id_to_label, locations
+        else:
+             print_error("No valid data loaded from CSVs.")
+             return None, None, None
+
     else:
         print_error("No CSV files found.")
         return None, None, None

@@ -1,0 +1,28 @@
+DEBUG: Rows: 3606959
+DEBUG: Rows: 3606959
+DEBUG: Rows: 3606956
+DEBUG: Rows after Node filter: 3606956
+DEBUG: Rows after Measurement map: 3606956
+DEBUG: Rows after Aggregation: 44118
+DEBUG: Rows after Quality Gate: 42960
+DEBUG: Rows: 3606959
+DEBUG: Rows: 3606959
+DEBUG: Rows: 3606956
+DEBUG: Rows after Node filter: 3606956
+DEBUG: Rows after Measurement map: 3606956
+DEBUG: Rows after Aggregation: 44118
+DEBUG: Rows after Quality Gate: 42960
+DEBUG: Rows: 3606959
+DEBUG: Rows: 3606959
+DEBUG: Rows: 462963
+DEBUG: Rows after Node filter: 462963
+DEBUG: Rows after Measurement map: 462963
+DEBUG: Rows after Aggregation: 10269
+DEBUG: Rows after Quality Gate: 9714
+DEBUG: Rows: 3606959
+DEBUG: Rows: 3606959
+DEBUG: Rows: 384616
+DEBUG: Rows after Node filter: 384616
+DEBUG: Rows after Measurement map: 384616
+DEBUG: Rows after Aggregation: 1455
+DEBUG: Rows after Quality Gate: 1449
