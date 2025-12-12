@@ -1,6 +1,6 @@
 # Sustainable Urbanization Through Innovative Technologies
 
-This project analyzes sensor data from the "Sustainable Urbanization" initiative. It provides a data processing pipeline, clustering analysis, and visualization tools to explore environmental sensor readings.
+A tool to analyze and visualize sensor data. It helps us track environmental trends and understand how spaces are being used to support sustainable urban planning.
 
 ## Structure
 
