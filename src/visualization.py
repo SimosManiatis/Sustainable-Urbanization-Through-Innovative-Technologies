@@ -12,8 +12,8 @@ try:
 except ImportError:
     SKLEARN_AVAILABLE = False
 
-def plot_optimization_metrics(k_range, inertia, silhouette):
-    """Plots Elbow (Inertia) and Silhouette scores."""
+def plot_optimization_metrics(k_range, inertia, silhouette, rejected=[]):
+    """Plots Elbow (Inertia) and Silhouette scores with Rejection Flags."""
     fig, ax1 = plt.subplots(figsize=(10, 6))
     
     # Inertia
@@ -28,13 +28,27 @@ def plot_optimization_metrics(k_range, inertia, silhouette):
     ax2 = ax1.twinx()
     color = 'tab:orange'
     ax2.set_ylabel('Silhouette Score', color=color)
-    # Use bar for silhouette? or line
     ax2.plot(k_range, silhouette, color=color, marker='s', linestyle='--', label='Silhouette')
+    
+    # Mark Rejected
+    if rejected:
+        for k in rejected:
+            if k in k_range:
+                idx = k_range.index(k)
+                val = silhouette[idx]
+                ax2.scatter([k], [val], color='red', marker='x', s=150, linewidth=3, zorder=20, label='Rejected (Size)')
+
     ax2.tick_params(axis='y', labelcolor=color)
     
     plt.title('Optimal K Analysis: Elbow Method & Silhouette Score')
     fig.tight_layout()
-    plt.show()
+    
+    # Save for Researcher Mode if dir exists
+    import os
+    if os.path.exists("reports/researcher"):
+        plt.savefig("reports/researcher/kselect_METRICS.png")
+    
+    plt.show() # Show for interactive users still
 
 def plot_cluster_analysis(results_df, centroids_df, label_map, sensor_name="Global"):
     """Comprehensive 3-panel visualization of clustering results."""
@@ -202,4 +216,175 @@ def plot_feature_profiles(centroids_df, label_map, sensor_name):
     ax.axhline(0, color='black', linewidth=0.8)
     
     plt.tight_layout()
-    plt.show()
+    if os.path.exists("reports/researcher"):
+        plt.savefig(f"reports/researcher/feature_profiles_{sensor_name}.png")
+        print("Saved feature_profiles.png")
+    else:
+        plt.show()
+
+# --- RESEARCHER MODE VISUALIZATIONS ---
+import os 
+
+def plot_coverage_timeline(df, input_period, title_suffix=""):
+    """V1: Coverage Timeline (Valid Bins)."""
+    # Helper to scan for valid bins (NaN check) per column
+    fig, ax = plt.subplots(figsize=(15, 6))
+    
+    # We want a heatmap: Rows=Rooms, X=Time
+    # 1. Inspect NAs
+    is_valid = df.notna().astype(int)
+    
+    # Plot imshow
+    # Aspect auto to stretch time
+    im = ax.imshow(is_valid.T, aspect='auto', cmap='RdYlGn', vmin=0, vmax=1)
+    
+    # Labels
+    ax.set_yticks(range(len(df.columns)))
+    ax.set_yticklabels(df.columns)
+    
+    # Time X-Axis (Rough index ticks)
+    n_ticks = 10
+    idxs = np.linspace(0, len(df)-1, n_ticks).astype(int)
+    labels = [df.index[i].strftime('%Y-%m-%d') for i in idxs]
+    ax.set_xticks(idxs)
+    ax.set_xticklabels(labels, rotation=45)
+    
+    ax.set_title(f"Data Coverage Timeline (Green=Valid, Red=Missing/Invalid) {title_suffix}")
+    plt.tight_layout()
+    
+    # Save (Researcher always saves)
+    if not os.path.exists("reports/researcher"): os.makedirs("reports/researcher")
+    plt.savefig(f"reports/researcher/coverage_TIMELINE_{title_suffix}.png")
+    plt.close()
+
+def plot_stacked_validation(level_series, feat_series, labels, title_suffix=""):
+    """V2/V3: Stacked Level vs Feature."""
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
+    
+    # Plot 1: Level
+    ax1.plot(level_series.index, level_series.values, color='navy', lw=1.5)
+    ax1.set_title(f"{labels[0]} (Level)")
+    ax1.fill_between(level_series.index, level_series.values, color='skyblue', alpha=0.3)
+    
+    # Plot 2: Feature
+    ax2.plot(feat_series.index, feat_series.values, color='darkorange', lw=1.5)
+    ax2.set_title(f"{labels[1]} (Derived Feature)")
+    ax2.fill_between(feat_series.index, feat_series.values, color='orange', alpha=0.3)
+    
+    _style_res_axis(ax1)
+    _style_res_axis(ax2)
+    
+    fig.suptitle(f"Feature Validation: {title_suffix}")
+    plt.tight_layout()
+    
+    if not os.path.exists("reports/researcher"): os.makedirs("reports/researcher")
+    plt.savefig(f"reports/researcher/feature_{title_suffix}.png")
+    plt.close()
+
+def plot_correlation_heatmap(matrix, title_suffix=""):
+    """V6: Feature Correlation."""
+    check_df = matrix.dropna()
+    corr = check_df.corr()
+    
+    fig, ax = plt.subplots(figsize=(12, 10))
+    im = ax.imshow(corr, cmap='RdBu_r', vmin=-1, vmax=1)
+    
+    # Ticks
+    ax.set_xticks(range(len(corr.columns)))
+    ax.set_yticks(range(len(corr.columns)))
+    ax.set_xticklabels(corr.columns, rotation=90, fontsize=8)
+    ax.set_yticklabels(corr.columns, fontsize=8)
+    
+    plt.colorbar(im, ax=ax, label='Correlation')
+    ax.set_title(f"Feature Correlation Matrix {title_suffix}")
+    plt.tight_layout()
+    
+    if not os.path.exists("reports/researcher"): os.makedirs("reports/researcher")
+    plt.savefig(f"reports/researcher/qc_CORR_{title_suffix}.png")
+    plt.close()
+
+def plot_state_share(labeled_df, title_suffix=""):
+    """V12: State Share Stacked Bar."""
+    # Crosstab
+    if "activity_label" not in labeled_df.columns: return
+    ct = pd.crosstab(labeled_df.index.get_level_values("NodeId"), labeled_df["activity_label"], normalize='index') * 100
+    
+    ax = ct.plot(kind='bar', stacked=True, figsize=(10, 6), colormap='viridis', alpha=0.9)
+    plt.title(f"State Share per Room {title_suffix}")
+    plt.ylabel("% Time")
+    plt.xlabel("Room") # Fix Label
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    
+    if not os.path.exists("reports/researcher"): os.makedirs("reports/researcher")
+    plt.savefig(f"reports/researcher/usage_SHARE_{title_suffix}.png")
+    plt.close()
+
+def plot_hourly_heatmap(labeled_df, node_id, title_suffix=""):
+    """V13: Hour-of-Day Heatmap for a node."""
+    # Filter node
+    subset = labeled_df[labeled_df.index.get_level_values("NodeId") == node_id]
+    if subset.empty: return
+    
+    # Extract Hour
+    times = subset.index.get_level_values("TimeBin")
+    hours = times.hour
+    
+    # Pivot
+    ct = pd.crosstab(subset["activity_label"], hours)
+    ct_norm = ct.div(ct.sum(axis=0), axis=1).fillna(0)
+    
+    fig, ax = plt.subplots(figsize=(12, 6))
+    im = ax.imshow(ct_norm, aspect='auto', cmap='plasma', vmin=0, vmax=1)
+    
+    ax.set_xticks(range(24))
+    ax.set_xlabel("Hour of Day")
+    ax.set_yticks(range(len(ct_norm.index)))
+    ax.set_yticklabels(ct_norm.index)
+    ax.set_ylabel("Activity State")
+    
+    # Fix Title Duplication
+    clean_suffix = title_suffix.replace(node_id, "").strip("_")
+    ax.set_title(f"Hourly Activity Profile: {node_id} {clean_suffix}")
+    
+    plt.colorbar(im, ax=ax, label="Prob")
+    plt.tight_layout()
+    
+    if not os.path.exists("reports/researcher"): os.makedirs("reports/researcher")
+    plt.savefig(f"reports/researcher/usage_HEATMAP_{node_id}_{title_suffix}.png")
+    plt.close()
+    
+def plot_transition_matrix(trans_matrix, title_suffix=""):
+    """V15: Transition Matrix Heatmap."""
+    fig, ax = plt.subplots(figsize=(8, 7))
+    im = ax.imshow(trans_matrix, cmap='Blues', vmin=0, vmax=1)
+    
+    # Add numbers
+    for i in range(len(trans_matrix)):
+        for j in range(len(trans_matrix)):
+            text = ax.text(j, i, f"{trans_matrix.iloc[i, j]:.2f}",
+                           ha="center", va="center", color="black" if trans_matrix.iloc[i, j] < 0.5 else "white")
+            
+    ax.set_xticks(range(len(trans_matrix.columns)))
+    ax.set_yticks(range(len(trans_matrix.index)))
+    ax.set_xticklabels(trans_matrix.columns)
+    ax.set_yticklabels(trans_matrix.index)
+    
+    ax.set_xlabel("To State")
+    ax.set_ylabel("From State")
+    
+    plt.colorbar(im, ax=ax, label="Transition Prob")
+    ax.set_title(f"Transition Matrix {title_suffix}")
+    plt.tight_layout()
+    
+    if not os.path.exists("reports/researcher"): os.makedirs("reports/researcher")
+    plt.savefig(f"reports/researcher/usage_TRANSITION_{title_suffix}.png")
+    plt.close()
+
+def _style_res_axis(ax):
+    """Helper for researcher plots."""
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.grid(True, linestyle=':', alpha=0.4)
+    # Ensure Date Formatting covers Day
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
