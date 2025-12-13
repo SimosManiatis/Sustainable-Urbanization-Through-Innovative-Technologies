@@ -5,506 +5,602 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.ticker as ticker
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 import glob
 
 # Try imports
 try:
     from sklearn.preprocessing import StandardScaler
     from sklearn.cluster import KMeans
-    from sklearn.metrics import silhouette_score
+    from sklearn.metrics import silhouette_score, adjusted_rand_score
     SKLEARN_AVAILABLE = True
+    from itertools import combinations
 except ImportError:
     SKLEARN_AVAILABLE = False
+    from itertools import combinations # Fallback if sklearn fails but itertools is stdlib
 
-# Ensure style
 plt.style.use('ggplot')
 
 class AnalysisValidation:
     def __init__(self, config):
         self.cfg = config
         self.run_dir = os.path.join(config["output_dir"], config["run_id"])
-        
         self.manifest = []
-        self.df_clean = None
-        self.master_index = None # Index of ALL bins in effective range
+        self.meta = {
+            "clipping_stats": {},
+            "dropped_features": []
+        }
         
-        # Warmup Rule (Explicit for Reference, but dynamically detected via NaNs)
-        self.warmup_duration_min = 15 
-        
-        self.completeness_df = None
-        self.validation_frame = None # Holds features aligned to master
-        self.gated_df = None
-        
-        self.feature_matrix = None
-        self.feature_matrix_scaled = None
-        
+        # Signals Definitions
         self.signals_map = {
             "Sound": "Sound_ave",
             "Light": "Light_ave"
         }
         
-        self.meta = {}
+        self.df_clean = None
+        self.master_index = None
 
-    def log_manifest(self, filename, desc):
+    def log_manifest(self, filename, desc, scope="Global"):
         type_ = os.path.splitext(filename)[1]
         fp = os.path.join(self.run_dir, filename)
         sz = os.path.getsize(fp) if os.path.exists(fp) else 0
-        from datetime import datetime
-        ts = datetime.now().isoformat()
-        
         self.manifest.append({
-            "filename": filename, 
-            "type": type_, 
-            "size_bytes": sz, 
-            "created": ts,
-            "description": desc
+            "filename": filename, "type": type_, "size_bytes": sz, 
+            "created": datetime.now().isoformat(), "description": desc, "scope": scope
         })
 
     def run(self):
-        print("\n--- Starting Analysis Validation Pipeline (Round 2) ---")
-        if not os.path.exists(self.run_dir):
-            os.makedirs(self.run_dir)
-            
-        # Reordered Pipeline
-        self.step1_load_data()
-        self.step2_build_timeline()
-        self.step3_compute_completeness()
-        self.step5_build_indicators() # MOVED UP: Features define Eligibility
-        self.step4_apply_gating()     # Gating uses Completeness + Features
-        self.step6_assemble_features()
-        self.step7_clustering()
-        self.step8_outputs()
-        self.save_metadata()
+        print("\n--- Starting Full Analysis Pipeline ---")
+        if not os.path.exists(self.run_dir): os.makedirs(self.run_dir)
         
+        # 1. Load (Common)
+        self.step_load_data()
+        self.step_build_timeline()
+        self.save_metadata(initial=True)
+        
+        # 2. Branch
+        targets = self.cfg["target_nodes"]
+        if len(targets) == 1:
+            print(f"-> Phase A: Per-Room Analysis ({targets[0]})")
+            self.run_phase_a(targets[0])
+        else:
+            print(f"-> Phase B: Global Analysis ({len(targets)} rooms)")
+            self.run_phase_b(targets)
+            
         print("\n--- Pipeline Complete ---")
         print(f"Results in: {self.run_dir}")
-        self.print_summary()
 
-    # --- STEP 1: LOAD & STANDARDIZE ---
-    def step1_load_data(self):
-        print("Step 1: Loading & Standardising...")
-        
-        # Mapping
+    # --- COMMON SETUP ---
+    def step_load_data(self):
+        print("Step 1: Loading & Cleaning...")
         with open(self.cfg["mapping_file"], 'r') as f:
             mdata = json.load(f)
         self.id_to_label = {str(v): k for k, v in mdata.get("measurements", {}).items()}
         
-        # Load CSV
         csv_files = glob.glob(os.path.join(self.cfg["raw_data_dir"], "*.csv"))
-        if not csv_files: raise FileNotFoundError("No CSV files found.")
-        latest_csv = max(csv_files, key=os.path.getctime)
-        self.meta["source_file"] = os.path.basename(latest_csv)
+        if not csv_files: raise FileNotFoundError("No CSVs.")
+        latest = max(csv_files, key=os.path.getctime)
+        self.meta["source_file"] = os.path.basename(latest)
         
-        df = pd.read_csv(latest_csv, low_memory=False)
-        self.meta["raw_row_count"] = len(df)
-        
-        # Timezone
+        df = pd.read_csv(latest, low_memory=False)
         df["SendDate"] = pd.to_datetime(df["SendDate"], utc=True, errors='coerce')
-        df = df.dropna(subset=["SendDate"])
+        df = df.dropna(subset=["SendDate"]).sort_values("SendDate")
         
-        # Value Used
+        # Value Logic
         if "CorrectValue" in df.columns:
-            df["value_used"] = df["CorrectValue"].fillna(df["Value"])
+            df["val"] = df["CorrectValue"].fillna(df["Value"])
         else:
-            df["value_used"] = df["Value"]
-        df["value_used"] = pd.to_numeric(df["value_used"], errors='coerce')
-        df = df.dropna(subset=["value_used"])
+            df["val"] = df["Value"]
+        df["val"] = pd.to_numeric(df["val"], errors='coerce')
+        df = df.dropna(subset=["val"])
         
-        # Date Clamping (Requested vs Effective)
-        req_s = self.cfg.get("start_dt")
-        req_e = self.cfg.get("end_dt")
-        data_s, data_e = df["SendDate"].min(), df["SendDate"].max()
-        
-        self.cfg["requested_start"] = str(req_s) if req_s else "None"
-        self.cfg["requested_end"] = str(req_e) if req_e else "None"
-        
-        # Clamp
-        eff_s = max(req_s, data_s) if req_s else data_s
-        eff_e = min(req_e, data_e) if req_e else data_e
-        
-        # If requested was outside data, use data limit? No, usually intersection.
-        # Logic: Effective is intersection of Request and Availability.
+        # Clamping
+        req_s, req_e = self.cfg.get("start_dt"), self.cfg.get("end_dt")
+        eff_s = str(max(req_s, df["SendDate"].min())) if req_s else str(df["SendDate"].min())
+        eff_e = str(min(req_e, df["SendDate"].max())) if req_e else str(df["SendDate"].max())
         
         df = df[(df["SendDate"] >= eff_s) & (df["SendDate"] <= eff_e)]
-        
-        # Signal Filter
-        targets = list(self.signals_map.values())
-        df["measurement_label"] = df["SensorId"].astype(str).map(self.id_to_label)
-        df = df[df["measurement_label"].isin(targets)]
+        self.cfg["effective_range"] = {"start": eff_s, "end": eff_e}
         
         # Scope
         if self.cfg["target_nodes"]:
              df = df[df["NodeId"].isin(self.cfg["target_nodes"])]
              
-        # Deduplicate
-        df = df.sort_values(["NodeId", "measurement_label", "SendDate"])
-        df = df.drop_duplicates(subset=["NodeId", "measurement_label", "SendDate"], keep='last')
+        # Detect Env
+        lbls = df["SensorId"].astype(str).map(self.id_to_label).unique()
+        if "Temperature_ave" in lbls: self.signals_map["Temp"] = "Temperature_ave"
+        if "AirQuality_ave" in lbls: self.signals_map["AQ"] = "AirQuality_ave"
         
-        self.df_clean = df.reset_index(drop=True)
-        self.meta["cleaned_row_count"] = len(self.df_clean)
-        self.cfg["effective_start_clamped"] = str(eff_s)
-        self.cfg["effective_end_clamped"] = str(eff_e)
+        # Filter
+        targs = list(self.signals_map.values())
+        df["label"] = df["SensorId"].astype(str).map(self.id_to_label)
+        df = df[df["label"].isin(targs)]
+        self.df_clean = df.drop_duplicates(["NodeId","label","SendDate"], keep='last')
 
-    # --- STEP 2: TIMELINE ---
-    def step2_build_timeline(self):
-        # Use Clamped Dates to build Master Index
-        s = pd.Timestamp(self.cfg["effective_start_clamped"]).floor(self.cfg["bin_size"])
-        e = pd.Timestamp(self.cfg["effective_end_clamped"]).ceil(self.cfg["bin_size"])
-        
-        self.cfg["timeline_start"] = str(s)
-        self.cfg["timeline_end"] = str(e)
-        
-        self.master_index = pd.date_range(start=s, end=e, freq=self.cfg["bin_size"])
-        self.meta["total_bins_timeline"] = len(self.master_index)
-        print(f"Step 2: Timeline {s} to {e} ({len(self.master_index)} bins)")
+    def step_build_timeline(self):
+        er = self.cfg["effective_range"]
+        s = pd.Timestamp(er["start"]).floor(self.cfg["bin_size"])
+        e = pd.Timestamp(er["end"]).ceil(self.cfg["bin_size"])
+        self.master_index = pd.date_range(s, e, freq=self.cfg["bin_size"])
+        self.meta["n_bins"] = len(self.master_index)
 
-    # --- STEP 3: COMPLETENESS ---
-    def step3_compute_completeness(self):
-        # Calculates Ratio (0.0/0.5/1.0) based on RAW presence
-        # Does NOT yet know about Feature Windowing NaNs
-        print("Step 3: Raw Completeness...")
+    # --- HELPERS ---
+    def enforce_temporal_continuity(self, labels, time_index, min_duration_mins):
+        """Merges short segments < min_duration into neighbors."""
+        if len(labels) == 0: return labels
         
-        df = self.df_clean.copy()
-        df["TimeBin"] = df["SendDate"].dt.floor(self.cfg["bin_size"])
+        # Convert to Series for easier handling
+        s = pd.Series(labels, index=time_index)
         
-        grouped = df.groupby(["NodeId", "TimeBin", "measurement_label"]).size().unstack(fill_value=0)
-        presence = (grouped > 0).astype(int)
-        
-        for sig in self.signals_map.values():
-            if sig not in presence.columns: presence[sig] = 0
+        # Iterative merge until stable
+        max_iters = 5
+        for _ in range(max_iters):
+            # Identify segments: (Value, Start, End, Count)
+            # Group by value change
+            grp = (s != s.shift()).cumsum()
+            segs = s.groupby(grp).agg(['first', 'count'])
+            # Calc duration? Index is TimeBin. 
+            # We can approximate duration by count * bin_size (assuming continuity)
+            # Or use exact time diff if gaps exist.
+            # Here we assume 'retained' bins might have gaps.
+            # If retained bins are sparse, "duration" is conceptual.
+            # Let's use Count * BinSize for now as "Effective Duration".
             
-        sig_cols = list(self.signals_map.values())
-        presence["ratio"] = presence[sig_cols].sum(axis=1) / len(sig_cols)
-        
-        # Reindex
-        nodes = self.cfg["target_nodes"]
-        from itertools import product
-        full_idx = pd.MultiIndex.from_product([nodes, self.master_index], names=["NodeId", "TimeBin"])
-        
-        self.completeness_df = presence.reindex(full_idx, fill_value=0)
-        # We will add refined flags in Step 4
+            bin_mins = pd.to_timedelta(self.cfg["bin_size"]).total_seconds() / 60
+            segs["duration"] = segs["count"] * bin_mins
+            
+            # Find short segments
+            short_mask = segs["duration"] < min_duration_mins
+            if not short_mask.any(): break
+            
+            # Merge logic: Rebuild array
+            # Simplest: For each short segment, look at prev/next segment
+            # Merge into the one with more samples? Or closest centroid? 
+            # We don't have centroids here easily. Merge into LARGER neighbor.
+            
+            # Map group_id -> new_label
+            # Iterate through groups
+            new_vals = []
+            param_groups = s.groupby(grp)
+            
+            # Convert to list of dicts for easier linear scan
+            seg_list = []
+            for gid, sub in param_groups:
+                seg_list.append({"gid": gid, "val": sub.iloc[0], "count": len(sub), "dur": len(sub)*bin_mins})
+                
+            # Forward scan to merge
+            # This is complex to do vectorized. Linear scan:
+            merged_list = []
+            if not seg_list: return labels
+            
+            curr = seg_list[0]
+            for i in range(1, len(seg_list)):
+                next_seg = seg_list[i]
+                
+                # Check if curr is short
+                if curr["dur"] < min_duration_mins:
+                    # Merge into next? (Assign curr's pixels to next's label? Or prev?)
+                    # Strategy: If curr short, take Next's label if Next is long?
+                    # Or keep accumulating until > min?
+                    # "Merge into valid neighbor".
+                    
+                    # If we have a 'prev' (merged_list is not empty), merge with prev?
+                    if merged_list:
+                        # Merge with prev
+                        prev = merged_list[-1]
+                        # Update prev count/dur
+                        # But wait, we change label to prev's label
+                        # curr is absorbed.
+                        # We don't Append curr. We just extend prev.
+                        # But label equality check? 
+                        # We just force curr's bins to take prev's label.
+                        # Actually logic: Labels array update.
+                        pass
+                        # This linear scan is tricky to implement robustly in one pass.
+                        # Let's stick to "Smallest Cluster Removal" approach if segments are hard?
+                        # No, User asked for "Run Length Encoding... Merge into neighbor".
+                    
+                    # Let's do a simple pass:
+                    # If segment i is short:
+                    #   Identify neighbors i-1 and i+1.
+                    #   Pick neighbor with max(duration).
+                    #   Change segment i's label to match that neighbor.
+                    #   Stop (one merge per iter to be safe? or can do all independent?)
+                    #   Doing all independent might conflict.
+                    pass
+            
+            # Vectorized approach using fillna?
+            # Replace short segment values with NaN, then ffill/bfill?
+            # 1. Mask short segments
+            # 2. Re-label
+            
+            # Get integer indices of short groups
+            short_ids = segs.index[short_mask]
+            
+            # Mask in original series
+            mask_indices = grp.isin(short_ids)
+            
+            if mask_indices.any():
+                # Set to NaN
+                # Ensure float for NaN
+                s_mod = s.astype(float)
+                s_mod[mask_indices] = np.nan
+                
+                # Interpolate (Nearest? or FFill?)
+                # "Merge into neighbor". Nearest implies temporal distance?
+                # FFill then BFill covers gaps.
+                s_mod = s_mod.ffill().bfill()
+                
+                # FIX: Handle residual NaNs (if all segments were short/masked)
+                if s_mod.isna().any():
+                    s_mod = s_mod.fillna(s.astype(float))
+                
+                s = s_mod.astype(int)
+            else:
+                break
+                
+        return s.values
 
-    # --- STEP 5: BUILD INDICATORS (Moved Up) ---
-    def step5_build_indicators(self):
-        print("Step 5: Building Indicators (Pre-Gating)...")
+    # --- CORE WORKER FUNCTIONS ---
+    def process_room_data(self, node):
+        """Prep 1: Returns raw_aligned, indicators_aligned, clipping_stats."""
+        ndf = self.df_clean[self.df_clean["NodeId"] == node].copy()
+        if ndf.empty: return None
         
-        frames = []
-        self.validation_plot_data = {}
+        res = {}; raw_plots = {}
         
-        def _compute(node_df, sig_label, logic_type, win):
-            # Resample 1min
-            sub = node_df[node_df["measurement_label"] == sig_label].copy()
+        # Helper
+        def _resample(sig_key, feat_type, win):
+            lbl = self.signals_map.get(sig_key)
+            if not lbl: return None
+            sub = ndf[ndf["label"] == lbl]
             if sub.empty: return None
-            ts = sub.set_index("SendDate")["value_used"].resample("1min").mean()
             
-            # Feature
+            # 1. Raw 1min
+            ts = sub.set_index("SendDate")["val"].resample("1min").mean()
+            
+            # 2. Indicator
             w = int(max(1, win))
-            if logic_type == "STD": feat = ts.rolling(window=w, min_periods=1).std()
-            elif logic_type == "Delta": feat = ts.diff(periods=w)
+            if feat_type == "STD": feat = ts.rolling(w, min_periods=max(1, w//2)).std()
+            elif feat_type == "Delta": feat = ts.diff(w)
             
-            # Agg
+            # 3. Agg
             agg = self.cfg["agg_method"]
-            binned = feat.resample(self.cfg["bin_size"]).agg(agg)
-            lev = ts.resample(self.cfg["bin_size"]).agg(agg)
-            return binned, lev
+            b_feat = feat.resample(self.cfg["bin_size"]).agg(agg)
+            b_raw = ts.resample(self.cfg["bin_size"]).agg(agg)
             
-        for node in self.cfg["target_nodes"]:
-            ndf = self.df_clean.loc[self.df_clean["NodeId"] == node].copy()
+            return b_raw, b_feat
             
-            s_res = _compute(ndf, self.signals_map["Sound"], "STD", 5)
-            l_res = _compute(ndf, self.signals_map["Light"], "Delta", 15)
+        # calc
+        s = _resample("Sound", "STD", 5)
+        l = _resample("Light", "Delta", 15)
+        if s: res["SoundVar"] = s[1]; raw_plots["Sound"] = s[0]
+        if l: res["LightChg"] = l[1]; raw_plots["Light"] = l[0]
+        
+        if "Temp" in self.signals_map:
+             t = _resample("Temp", "Delta", 15)
+             if t: res["TempDelta"] = t[1]
+             
+        if "AQ" in self.signals_map:
+             aq = _resample("AQ", "Delta", 15)
+             if aq: res["AQDelta"] = aq[1]
+             
+        # Align
+        if not res: return None
+        
+        idf = pd.DataFrame(res, index=self.master_index)
+        idf.index.name = "TimeBin"
+        raf = pd.DataFrame(raw_plots, index=self.master_index)
+        
+        # Outlier Clip
+        for c in idf.columns:
+            lo = idf[c].quantile(0.01); hi = idf[c].quantile(0.99)
+            idf[c] = idf[c].clip(lo, hi)
+            self.meta["clipping_stats"][f"{node}_{c}"] = {"lo": lo, "hi": hi}
             
-            if s_res and l_res:
-                s_feat, s_lev = s_res
-                l_feat, l_lev = l_res
-                
-                self.validation_plot_data[node] = {
-                    "SoundLevel": s_lev, "SoundVar": s_feat,
-                    "LightLevel": l_lev, "LightChg": l_feat
-                }
-                
-                # Align to Master
-                tmp = pd.DataFrame({
-                    "SoundVar": s_feat.reindex(self.master_index),
-                    "LightChg": l_feat.reindex(self.master_index)
-                }, index=self.master_index)
-                tmp.index.name = "TimeBin"
-                tmp["NodeId"] = node
-                frames.append(tmp.reset_index())
-                
-        if frames:
-            self.validation_frame = pd.concat(frames).set_index(["NodeId", "TimeBin"])
-        else:
-            self.validation_frame = pd.DataFrame()
+        return raf, idf
 
-    # --- STEP 4: GATING (Refined) ---
-    def step4_apply_gating(self):
-        print("Step 4: Gating (Eligible vs Retained)...")
+    def assess_inclusion(self, node, raw_df, ind_df):
+        """Prep 2: 4-Level Accounting."""
+        # 1. Total
+        total_bins = len(self.master_index)
         
-        # Merge Completeness + Features
-        # Both are MultiIndex (Node, TimeBin) aligned to Master
+        # 2. Raw Available (Sound & Light Required)
+        # Check raw non-null
+        req = ["Sound", "Light"]
+        # Add dummy if missing
+        check = raw_df.copy()
+        for r in req: 
+            if r not in check.columns: check[r] = np.nan
+        has_raw = check[req].notna().all(axis=1)
         
-        # Prepare Master Frame
-        self.full_status = self.completeness_df[["ratio"]].copy()
+        # 3. Indicator Valid
+        # Check all calculated indicators non-null
+        has_ind = ind_df.notna().all(axis=1)
         
-        # Join Features
-        if not self.validation_frame.empty:
-            self.full_status = self.full_status.join(self.validation_frame, how='left')
-        else:
-            self.full_status["SoundVar"] = np.nan
-            self.full_status["LightChg"] = np.nan
-            
-        # Definition: Eligible if Features are VALID (Not NaN)
-        # This implicitly handles Windowing NaNs
-        self.full_status["has_valid_features"] = (
-            self.full_status["SoundVar"].notna() & self.full_status["LightChg"].notna()
-        )
+        # 4. Retained
+        # Must have Raw AND Ind
+        is_retained = has_raw & has_ind
         
-        self.full_status["is_eligible"] = self.full_status["has_valid_features"]
+        stats = {
+            "Total": total_bins,
+            "Raw_Avail": has_raw.sum(),
+            "Ind_Valid": has_ind.sum(), # Note: Ind valid usually implies raw, but windowing kills start
+            "Retained": is_retained.sum()
+        }
         
-        # Definition: Retained if Eligible AND Ratio=1.0 (Raw complete)
-        self.full_status["is_retained"] = (
-            self.full_status["is_eligible"] & (self.full_status["ratio"] == 1.0)
-        )
+        # Flags df
+        flags = pd.DataFrame({
+            "has_raw": has_raw, "has_ind": has_ind, "is_retained": is_retained
+        }, index=self.master_index)
         
-        # Stats
-        self.stats = []
-        for node in self.cfg["target_nodes"]:
-            sub = self.full_status.loc[node]
-            total = len(sub)
-            eligible = sub["is_eligible"].sum()
-            retained = sub["is_retained"].sum()
-            
-            self.stats.append({
-                "Room": node,
-                "Total": total,
-                "Eligible": eligible,
-                "Retained": retained,
-                "Warmup_Excluded": total - eligible
-            })
-            
-        self.gated_df = self.full_status[self.full_status["is_retained"]].copy()
+        return stats, flags, ind_df[is_retained]
 
-    # --- STEP 6: ASSEMBLE ---
-    def step6_assemble_features(self):
-        print("Step 6: Assembling Matrix...")
-        if self.gated_df.empty: 
-            self.feature_matrix = pd.DataFrame()
-            return
-            
-        # Just pick columns from gated_df
-        self.feature_matrix = self.gated_df[["SoundVar", "LightChg"]].copy()
+    def perform_clustering(self, feat_df, name_prefix):
+        """Standardize -> Sweep (ARI + Temporal) -> Select -> Fit."""
+        if feat_df.empty: return None, 0
+        
+        # Drop constant
+        df = feat_df.copy()
+        df = df.loc[:, df.std() > 0]
+        if df.empty: return None, 0
         
         if SKLEARN_AVAILABLE:
-            scaler = StandardScaler()
-            self.feature_matrix_scaled = pd.DataFrame(
-                scaler.fit_transform(self.feature_matrix),
-                index=self.feature_matrix.index,
-                columns=self.feature_matrix.columns
-            )
-
-    # --- STEP 7: CLUSTERING ---
-    def step7_clustering(self):
-        print("Step 7: Clustering...")
-        if self.feature_matrix is None or self.feature_matrix.empty: return
-        
-        X = self.feature_matrix_scaled.values
-        min_size = int(len(X) * 0.03)
-        self.meta["min_cluster_size"] = min_size
-        
-        sweep_res = []
-        best_k = 2; best_sil = -1
-        
-        for k in range(2, 11):
-            km = KMeans(n_clusters=k, random_state=42, n_init=10)
-            lbls = km.fit_predict(X)
-            sil = silhouette_score(X, lbls)
+            X = StandardScaler().fit_transform(df)
             
-            counts = np.bincount(lbls)
-            rej = False; reason = None
-            if np.min(counts) < min_size:
-                rej = True; reason = f"Min Cluster < {min_size}"
-            else:
-                if sil > best_sil: best_k = k; best_sil = sil
+            # Constraints
+            bin_mins = pd.to_timedelta(self.cfg["bin_size"]).total_seconds() / 60
+            min_samples = int(np.ceil(120 / bin_mins))
+            self.meta["clustering_params"] = {"min_duration_min": 120, "min_samples": min_samples}
+            
+            sweep_data = []
+            best_k = None
+            
+            for k in range(2, 11):
+                # Run 10 seeds
+                seed_res = []
+                for seed in range(10):
+                    km = KMeans(n_clusters=k, random_state=seed, n_init=10)
+                    lbs = km.fit_predict(X)
+                    sil = silhouette_score(X, lbs)
+                    
+                    # Apply Temporal Merge to check effective size
+                    lbs_merged = self.enforce_temporal_continuity(lbs, df.index, 120)
+                    min_sz = np.min(np.bincount(lbs_merged)) if len(lbs_merged) > 0 else 0
+                    
+                    seed_res.append({
+                        "lbs": lbs, "sil": sil, "min_sz_post": min_sz
+                    })
                 
-            sweep_res.append({
-                "k": k, "silhouette": sil, "inertia": km.inertia_,
-                "min_size": int(np.min(counts)), "rejected": rej, "reason": reason
-            })
-            
-        self.sweep_df = pd.DataFrame(sweep_res)
-        self.selected_k = best_k
-        self.sweep_df.to_csv(os.path.join(self.run_dir, "k_sweep.csv"), index=False)
-        self.log_manifest("k_sweep.csv", "Clustering metrics")
-        
-        km = KMeans(n_clusters=best_k, random_state=42, n_init=20)
-        self.feature_matrix["StateID"] = km.fit_predict(X)
-        self.feature_matrix_scaled["StateID"] = self.feature_matrix["StateID"]
-        print(f"  Selected K={best_k}")
+                # ARI Stability
+                aris = []
+                for i, j in combinations(range(10), 2):
+                    aris.append(adjusted_rand_score(seed_res[i]["lbs"], seed_res[j]["lbs"]))
+                ari_mean = np.mean(aris) if aris else 0
+                
+                # Stats
+                sils = [r["sil"] for r in seed_res]
+                sil_mean = np.mean(sils)
+                sil_std = np.std(sils)
+                
+                # Worst-case min size across seeds (Safety)
+                min_sz_min = np.min([r["min_sz_post"] for r in seed_res])
+                
+                # Validity: All seeds generated valid structure? Or Average?
+                # User: "Report min_sz_min... Strict safety check".
+                is_valid = min_sz_min >= min_samples
+                
+                # Score: Sil - Penalty + ARI Bonus
+                score = sil_mean - (0.5 * sil_std) + (0.1 * ari_mean)
+                
+                sweep_data.append({
+                    "k": k, "sil_mean": sil_mean, "sil_std": sil_std, "ari_mean": ari_mean,
+                    "min_sz_min": min_sz_min, "valid": is_valid, "score": score
+                })
 
-    # --- STEP 8: OUTPUTS ---
-    def step8_outputs(self):
-        print("Step 8: Output Generation...")
-        
-        # A: Heatmap (Refined: Ineligible = Grey)
-        # Logic: 0=Red, 1=Orange, 2=Green, 3=Grey (Excluded)
-        # Excluded if NOT eligible
-        
-        hm_ratio = self.full_status["ratio"].unstack("TimeBin")
-        hm_elig = self.full_status["is_eligible"].unstack("TimeBin")
-        
-        viz = pd.DataFrame(0, index=hm_ratio.index, columns=hm_ratio.columns)
-        viz[hm_ratio == 0.5] = 1
-        viz[hm_ratio == 1.0] = 2
-        viz[~hm_elig] = 3 # Overwrite with Grey if Ineligible
-        
-        import matplotlib.colors as mcolors
-        cmap = mcolors.ListedColormap(['#FFCDD2', '#FFCC80', '#A5D6A7', '#E0E0E0'])
-        bounds = [-0.5, 0.5, 1.5, 2.5, 3.5]
-        norm = mcolors.BoundaryNorm(bounds, cmap.N)
-        
-        fig, ax = plt.subplots(figsize=(12, 5))
-        im = ax.imshow(viz, aspect='auto', cmap=cmap, norm=norm)
-        
-        # Ticks
-        n_ticks = 10
-        idxs = np.linspace(0, len(viz.columns)-1, n_ticks).astype(int)
-        labels = [viz.columns[i].strftime('%m-%d %H') for i in idxs]
-        ax.set_xticks(idxs); ax.set_xticklabels(labels, rotation=45)
-        ax.set_yticks(range(len(viz.index))); ax.set_yticklabels(viz.index)
-        ax.set_title("Completeness (Green=Retained, Grey=Excluded/Warmup)")
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.run_dir, "completeness_heatmap.png"))
-        plt.close()
-        self.log_manifest("completeness_heatmap.png", "Completeness")
-        
-        # B: Inclusion (3 Bars)
-        if self.stats:
-            sdf = pd.DataFrame(self.stats).set_index("Room")
-            ax = sdf[["Total", "Eligible", "Retained"]].plot(kind='bar', color=['gray', 'blue', 'green'], figsize=(8,5))
-            plt.title("Inclusion Impact (Total -> Eligible -> Retained)")
-            plt.tight_layout()
-            plt.savefig(os.path.join(self.run_dir, "inclusion_impact.png"))
+            sdf = pd.DataFrame(sweep_data)
+            
+            # Selection (Richer K Rule)
+            valid_cands = sdf[sdf["valid"]].copy()
+            
+            if valid_cands.empty:
+                print(f"  [{name_prefix}] Skipped (Degenerate/Unstable).")
+                best_k = None
+            else:
+                top_score = valid_cands["score"].max()
+                # Candidates within epsilon
+                epsilon = 0.02
+                candidates = valid_cands[valid_cands["score"] >= top_score - epsilon]
+                
+                # Select LARGEST K among good candidates (Richer Structure)
+                best_row = candidates.sort_values("k", ascending=False).iloc[0]
+                best_k = int(best_row["k"])
+                
+                if len(candidates) > 1:
+                     print(f"  [{name_prefix}] Selected Richer K={best_k} (Score {best_row['score']:.3f} vs Max {top_score:.3f})")
+
+            # Save Sweep
+            sdf.to_csv(os.path.join(self.run_dir, f"{name_prefix}_k_sweep.csv"), index=False)
+            self.log_manifest(f"{name_prefix}_k_sweep.csv", "Sweep Data", name_prefix)
+            
+            # Plot
+            fig, ax = plt.subplots(figsize=(8,5))
+            val = sdf[sdf["valid"]]; inv = sdf[~sdf["valid"]]
+            if not val.empty: ax.errorbar(val["k"], val["sil_mean"], yerr=val["sil_std"], fmt='bo-', label='Valid')
+            if not inv.empty: ax.errorbar(inv["k"], inv["sil_mean"], yerr=inv["sil_std"], fmt='rx', label='Rejected')
+            
+            if best_k:
+                sel = sdf[sdf["k"]==best_k].iloc[0]
+                ax.scatter(sel["k"], sel["sil_mean"], c='gold', marker='*', s=300, zorder=10, label=f"Sel K={best_k}")
+                
+            plt.title(f"K Selection ({name_prefix})\nAdjusted for Stability & Duration")
+            plt.legend()
+            plt.savefig(os.path.join(self.run_dir, f"{name_prefix}_k_selection.png"))
             plt.close()
-            self.log_manifest("inclusion_impact.png", "3-Tier Inclusion Stats")
             
-        # C/D: Validation
-        if self.validation_plot_data:
-            room = "TRP4" if "TRP4" in self.validation_plot_data else list(self.validation_plot_data.keys())[0]
-            d = self.validation_plot_data[room]
+            # Final Fit & Merge
+            if best_k:
+                # Retrain
+                km = KMeans(n_clusters=best_k, random_state=42, n_init=20)
+                raw_lbs = km.fit_predict(X)
+                
+                # Apply Temporal Merge
+                final_lbs = self.enforce_temporal_continuity(raw_lbs, df.index, 120)
+                df["StateID"] = final_lbs
+                
+                # Centroids (Recalculated on merged labels)
+                # Note: Merge might eliminate a StateID if it was entirely short segments.
+                # So we check unique states.
+                df.groupby("StateID").mean().to_csv(os.path.join(self.run_dir, f"{name_prefix}_centroids_raw.csv"))
+                
+                return df, best_k
             
-            # Sound
-            fig, ax1 = plt.subplots(figsize=(10, 4))
-            ax2 = ax1.twinx()
-            ax1.plot(d["SoundLevel"].index, d["SoundLevel"], 'b', alpha=0.6, label='Level')
-            ax2.plot(d["SoundVar"].index, d["SoundVar"], 'orange', label='Var')
-            ax1.set_title(f"Sound Validation ({room})")
-            plt.savefig(os.path.join(self.run_dir, "sound_validation.png")); plt.close()
-            
-            # Light
-            fig, ax1 = plt.subplots(figsize=(10, 4))
-            ax2 = ax1.twinx()
-            ax1.plot(d["LightLevel"].index, d["LightLevel"], 'b', alpha=0.6, label='Level')
-            ax2.plot(d["LightChg"].index, d["LightChg"], 'orange', label='Change')
-            ax1.set_title(f"Light Validation ({room})")
-            plt.savefig(os.path.join(self.run_dir, "light_validation.png")); plt.close()
-            
-            self.log_manifest("sound_validation.png", "Sound Val")
-            self.log_manifest("light_validation.png", "Light Val")
-            
-        # E: K-Selection (Annotated)
-        if hasattr(self, "sweep_df"):
-             fig, ax = plt.subplots(figsize=(8, 5))
-             ax.plot(self.sweep_df["k"], self.sweep_df["silhouette"], 'b-o')
-             
-             sel = self.sweep_df[self.sweep_df["k"] == self.selected_k].iloc[0]
-             ax.scatter(sel["k"], sel["silhouette"], s=200, c='red', marker='*')
-             
-             rej = self.sweep_df[self.sweep_df["rejected"]]
-             if not rej.empty:
-                 ax.scatter(rej["k"], rej["silhouette"], s=100, c='black', marker='x')
-            
-             plt.title(f"K Selection (Selected K={self.selected_k})")
-             plt.savefig(os.path.join(self.run_dir, "k_selection.png")); plt.close()
-             self.log_manifest("k_selection.png", "K Selection")
-             
-        # F: Profiles
-        if hasattr(self, "feature_matrix") and "StateID" in self.feature_matrix:
-            raw_c = self.feature_matrix.groupby("StateID")[["SoundVar", "LightChg"]].mean()
-            raw_c.to_csv(os.path.join(self.run_dir, "centroids_raw.csv"))
-            
-            raw_c.plot(kind='bar', figsize=(8, 5))
-            plt.title("Cluster Profiles (Raw Units)")
-            plt.tight_layout()
-            plt.savefig(os.path.join(self.run_dir, "cluster_profiles.png")); plt.close()
-            self.log_manifest("cluster_profiles.png", "Profiles")
-            self.log_manifest("centroids_raw.csv", "Raw Centroids")
-            
-        # G: Share
-        if hasattr(self, "feature_matrix"):
-            ct = pd.crosstab(self.feature_matrix.index.get_level_values("NodeId"), 
-                             self.feature_matrix["StateID"], normalize='index') * 100
-            
-            # Annotated Axis
-            counts = self.feature_matrix.index.get_level_values("NodeId").value_counts()
-            ax = ct.plot(kind='bar', stacked=True, figsize=(10,6))
-            labels = [f"{n}\n(n={counts.get(n,0)})" for n in ct.index]
-            ax.set_xticklabels(labels, rotation=0)
-            ax.set_xlabel("Room")
-            plt.title("State Share")
-            plt.savefig(os.path.join(self.run_dir, "state_share.png")); plt.close()
-            self.log_manifest("state_share.png", "Share")
-            
-        # H: Transitions (Integer Ticks)
-        if hasattr(self, "feature_matrix"):
-            # Contiguous logic assumed from previous ver (omitted for brevity, assume retained)
-            # Re-implementing compact
-            bin_delta = pd.to_timedelta(self.cfg["bin_size"])
-            df = self.feature_matrix.sort_index()
-            pairs = []
-            for n in df.index.get_level_values("NodeId").unique():
-                 sub = df.xs(n, level="NodeId")
-                 times = sub.index
-                 s = sub["StateID"].values
-                 for i in range(len(times)-1):
-                     if times[i+1] - times[i] == bin_delta:
-                         pairs.append((s[i], s[i+1]))
-            
-            if pairs:
-                tr = pd.DataFrame(pairs, columns=["From", "To"])
-                mat = pd.crosstab(tr["From"], tr["To"], normalize='index')
-                fig, ax = plt.subplots()
-                im = ax.imshow(mat, cmap='Blues')
-                # Integer ticks
-                k_size = len(mat)
-                ax.set_xticks(range(k_size)); ax.set_xticklabels(mat.columns)
-                ax.set_yticks(range(k_size)); ax.set_yticklabels(mat.index)
-                plt.title("Transition Matrix")
-                plt.colorbar(im)
-                plt.savefig(os.path.join(self.run_dir, "transition_matrix.png")); plt.close()
-                self.log_manifest("transition_matrix.png", "Transitions")
+        return None, 0
 
-    def save_metadata(self):
+    def generate_usage_plots(self, tagged_df, name_prefix):
+        # Share
+        cts = tagged_df["StateID"].value_counts(normalize=True).sort_index()
+        cts.plot(kind='bar', figsize=(6,4))
+        plt.title(f"State Share ({name_prefix})")
+        plt.ylabel("Freq")
+        plt.savefig(os.path.join(self.run_dir, f"{name_prefix}_state_share.png"))
+        plt.close()
+        
+        # Transitions
+        # Explicit Gap Check
+        df = tagged_df.sort_index() # Index is MultiIndex (Node, Time) or just Time?
+        # If Single Room, Index is TimeBin
+        # If Global, Index is Multi (Node, Time)
+        
+        pairs = []
+        delta = pd.to_timedelta(self.cfg["bin_size"])
+        
+        if "NodeId" in df.index.names:
+            nodes = df.index.get_level_values("NodeId").unique()
+            for n in nodes:
+                 sub = df.xs(n, level="NodeId")
+                 t = sub.index; s = sub["StateID"].values
+                 for i in range(len(t)-1):
+                     if t[i+1]-t[i] == delta: pairs.append((s[i], s[i+1]))
+        else:
+             t = df.index; s = df["StateID"].values
+             for i in range(len(t)-1):
+                 if t[i+1]-t[i] == delta: pairs.append((s[i], s[i+1]))
+                 
+        if pairs:
+             tr = pd.DataFrame(pairs, columns=["From","To"])
+             mat = pd.crosstab(tr["From"], tr["To"], normalize='index')
+             fig, ax = plt.subplots()
+             im = ax.imshow(mat, cmap='Blues')
+             ax.set_xticks(range(len(mat))); ax.set_xticklabels(mat.columns)
+             ax.set_yticks(range(len(mat))); ax.set_yticklabels(mat.index)
+             plt.colorbar(im)
+             plt.title(f"Transitions ({name_prefix})")
+             plt.savefig(os.path.join(self.run_dir, f"{name_prefix}_transition.png"))
+             plt.close()
+
+    # --- PHASE A: SINGLE ROOM ---
+    def run_phase_a(self, node):
+        # 1. Prep
+        raw, ind = self.process_room_data(node)
+        
+        # 2. Accounting
+        stats, flags, retained_df = self.assess_inclusion(node, raw, ind)
+        
+        # 3. Plots
+        # 3a. Inclusion Impact
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.bar(["Total", "Raw", "Ind", "Retained"], 
+               [stats["Total"], stats["Raw_Avail"], stats["Ind_Valid"], stats["Retained"]],
+               color=['gray', 'orange', 'blue', 'green'])
+        plt.title(f"Inclusion Impact: {node}")
+        plt.savefig(os.path.join(self.run_dir, f"{node}_inclusion_impact.png"))
+        plt.close()
+        
+        # 3b. Diagnostic
+        fig, ax1 = plt.subplots(figsize=(10,5))
+        ax2 = ax1.twinx()
+        if "Sound" in raw: ax1.plot(raw.index, raw["Sound"], 'b-', alpha=0.3, label="Sound")
+        if "SoundVar" in ind: ax2.plot(ind.index, ind["SoundVar"], 'b--', label="SoundVar")
+        if "Light" in raw: ax1.plot(raw.index, raw["Light"], 'g-', alpha=0.3, label="Light")
+        if "LightChg" in ind: ax2.plot(ind.index, ind["LightChg"], 'g--', label="LightChg")
+        plt.title(f"Diagnostic Timeline: {node}")
+        plt.savefig(os.path.join(self.run_dir, f"{node}_diagnostic_timeline.png"))
+        plt.close()
+        
+        # 3c. Completeness
+        # 0=Miss, 1=Raw, 2=Ind, 3=Ret
+        # Simple map: Retained=Green, Else=Grey/Red
+        viz = pd.Series(0, index=flags.index)
+        viz[flags["has_raw"]] = 1
+        viz[flags["has_ind"]] = 2 # Overwrites raw
+        viz[flags["is_retained"]] = 3
+        
+        # Plot strip
+        fig, ax = plt.subplots(figsize=(12, 2))
+        ax.imshow(viz.values.reshape(1, -1), aspect='auto', cmap='RdYlGn', vmin=0, vmax=3)
+        ax.set_yticks([]); ax.set_title(f"Completeness Strip: {node}")
+        plt.savefig(os.path.join(self.run_dir, f"{node}_completeness.png"))
+        plt.close()
+        
+        # 4. Cluster
+        if not retained_df.empty:
+            res_df, k = self.perform_clustering(retained_df, node)
+            if res_df is not None:
+                self.generate_usage_plots(res_df, node)
+                res_df.to_csv(os.path.join(self.run_dir, f"{node}_labelled_retained.csv"))
+            else:
+                print(f"  [{node}] Clustering skipped (degenerate/unstable).")
+            
+        self.save_metadata(initial=False, stats=[stats])
+
+    # --- PHASE B: GLOBAL ---
+    def run_phase_b(self, nodes):
+        all_retained = []
+        all_stats = []
+        
+        for node in nodes:
+            print(f"  Processing {node}...")
+            raw, ind = self.process_room_data(node)
+            stats, flags, ret = self.assess_inclusion(node, raw, ind)
+            stats["Room"] = node
+            all_stats.append(stats)
+            
+            if not ret.empty:
+                ret["NodeId"] = node
+                ret = ret.set_index("NodeId", append=True).swaplevel(0,1) # Node, Time
+                all_retained.append(ret)
+                
+        # Global Inclusion
+        sdf = pd.DataFrame(all_stats).set_index("Room")
+        sdf[["Total","Raw_Avail","Ind_Valid","Retained"]].plot(kind='bar', figsize=(10,6))
+        plt.title("Inclusion Impact (All Rooms)")
+        plt.savefig(os.path.join(self.run_dir, "inclusion_impact_all_rooms.png"))
+        plt.close()
+        
+        # Global Cluster
+        if all_retained:
+            full_df = pd.concat(all_retained)
+            res_df, k = self.perform_clustering(full_df, "global")
+            if res_df is not None:
+                self.generate_usage_plots(res_df, "global")
+            else:
+                print("  [Global] Clustering skipped (degenerate).")
+            
+        self.save_metadata(initial=False, stats=all_stats)
+
+    def save_metadata(self, initial=False, stats=None):
         out = self.cfg.copy()
         for k, v in out.items():
             if isinstance(v, (pd.Timestamp, datetime)): out[k] = str(v)
             
-        out["stats"] = self.stats
+        if stats: out["stats"] = stats
         out["meta"] = self.meta
         
-        def np_enc(o):
-            if isinstance(o, np.generic): return o.item()
-            raise TypeError
-            
-        with open(os.path.join(self.run_dir, "run_config.json"), 'w') as f:
-            json.dump(out, f, indent=4, default=np_enc)
-        self.log_manifest("run_config.json", "Config")
+        def enc(o): return o.item() if isinstance(o, np.generic) else str(o)
         
-        pd.DataFrame(self.manifest).to_csv(os.path.join(self.run_dir, "manifest.csv"), index=False)
-        print("  -> Saved manifest.csv")
-
-    def print_summary(self):
-        print("\n--- Run Summary ---")
-        df_stats = pd.DataFrame(self.stats).set_index("Room")
-        print(df_stats[["Total", "Eligible", "Retained", "Warmup_Excluded"]])
+        with open(os.path.join(self.run_dir, "run_config.json"), 'w') as f:
+            json.dump(out, f, indent=4, default=enc)
+            
+        if not initial:
+            pd.DataFrame(self.manifest).to_csv(os.path.join(self.run_dir, "manifest.csv"), index=False)

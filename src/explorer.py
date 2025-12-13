@@ -257,47 +257,46 @@ def get_full_inputs(mode_idx, df, locations, id_to_label):
     inputs = _get_common_inputs(df, locations)
     inputs["mode_idx"] = mode_idx
     
-    # Mode 1: Level Trend
+    # Mode 1: Trend Explorer
     if mode_idx == 0:
-        measurements = sorted(list(set(id_to_label.values())))
-        inputs["label"] = get_user_choice("Select Measurement:", measurements)
-        dtypes = {"Mean": "mean", "Min": "min", "Max": "max", "First": "first"}
-        inputs["dtype_name"] = get_user_choice("Data Type:", list(dtypes.keys()))
-        inputs["agg_func"] = dtypes[inputs["dtype_name"]]
+        view_type = get_user_choice("Select View Type:", ["Levels", "Activity Features"])
+        inputs["trend_mode"] = view_type
         
-    # Mode 2: Activity Trend
-    elif mode_idx == 1:
         measurements = sorted(list(set(id_to_label.values())))
-        inputs["label"] = get_user_choice("Base Measurement:", measurements)
-        inputs["feature_type"] = get_user_choice("Feature:", ["Rolling STD", "Delta"])
-        if inputs["feature_type"] == "Rolling STD":
-            inputs["window"] = float(get_user_choice("Window (min):", ["1", "2.5", "5", "10"]))
-        else:
-            inputs["window"] = float(get_user_choice("Window (min):", ["2", "5", "15"]))
-        inputs["agg_func"] = "mean" # Default for feature
-        inputs["dtype_name"] = f"{inputs['feature_type']} {inputs['window']}"
+        
+        if view_type == "Levels":
+            inputs["label"] = get_user_choice("Select Measurement:", measurements)
+            dtypes = {"Mean": "mean", "Min": "min", "Max": "max", "First": "first"}
+            inputs["dtype_name"] = get_user_choice("Data Type:", list(dtypes.keys()))
+            inputs["agg_func"] = dtypes[inputs["dtype_name"]]
+        else: # Activity
+            inputs["label"] = get_user_choice("Base Measurement:", measurements)
+            inputs["feature_type"] = get_user_choice("Feature:", ["Rolling STD", "Delta"])
+            if inputs["feature_type"] == "Rolling STD":
+                inputs["window"] = float(get_user_choice("Window (min):", ["1", "2.5", "5", "10"]))
+            else:
+                inputs["window"] = float(get_user_choice("Window (min):", ["2", "5", "15"]))
+            inputs["agg_func"] = "mean"
+            inputs["dtype_name"] = f"{inputs['feature_type']} {inputs['window']}"
 
-    # Mode 3: Matrix Builder
-    elif mode_idx == 2:
-        inputs["preset"] = get_user_choice("Feature Preset:", ["Minimal", "Full"])
-        inputs["validity"] = get_user_choice("Validity:", ["Strict", "Flexible"])
-        # Check BME
-        inputs["include_bme680"] = False # Default
-
-    # Mode 4: Clustering
-    elif mode_idx == 3:
-        # Need matrix inputs too to build it on fly? Or load?
-        # Simpler: Build on fly for now (User said "Build matrix now OR load"). 
-        # We will assume Build Now for Explorer simplicity (Batch logic).
-        inputs["preset"] = "Minimal" # Default for clustering demo
-        inputs["k_strategy"] = get_user_choice("K Strategy:", ["Auto Scale", "Manual"])
-        if inputs["k_strategy"] == "Manual":
-            inputs["manual_k"] = int(input("Enter K: "))
-            
-    # Mode 8: Analysis Validation
-    elif mode_idx == 8:
+    # Mode 2: Analysis Validation
+    elif mode_idx == 1:
         inputs["agg_func"] = get_user_choice("Aggregation Method:", ["mean", "median"])
-            
+
+    # Mode 3: Automate Run
+    elif mode_idx == 2:
+        inputs["agg_func"] = get_user_choice("Aggregation Method:", ["mean", "median"])
+        # Param Selection
+        params = {
+            "Sound Level": "Sound_ave",
+            "Light Level": "Light_ave",
+            "Temperature": "Temperature_ave",
+            "Air Quality": "AirQuality_ave",
+            "Humidity": "Humidity_ave"
+        }
+        inputs["param_label"] = get_user_choice("Select Parameter to Visualize:", list(params.keys()))
+        inputs["label"] = params[inputs["param_label"]] # Map to sensor label
+
     return inputs
 
 # --- PLOTTING HELPERS --- (Reusing existing plot logic slightly adapted)
@@ -337,7 +336,7 @@ def plot_trend(df, inputs, locations):
 
 # --- MAIN ---
 def run_sensor_trend_explorer():
-    print_header("Sensor Trend Explorer")
+    # print_header("Sensor Trend Explorer") # Removed to avoid double print
     print_info("Setup", "Loading dataset...")
     df, id_to_label, locations = load_raw_data()
     if df is None or df.empty: return
@@ -347,15 +346,9 @@ def run_sensor_trend_explorer():
     df = df.dropna(subset=["SendDate"])
 
     modes = [
-        "Trend Views (Levels)",
-        "Trend Views (Activity Features)",
-        "Feature Matrix Builder",
-        "K-means Activity Clustering",
-        "Cluster Review (Not Impl)",
-        "Room Usage Reporting (Not Impl)",
-        "Batch Run",
-        "Researcher Mode (Scientific Validation)",
-        "Analysis Validation (Strict Pipeline)"
+        "Trend Explorer",
+        "Analysis Validation",
+        "Automate Run"
     ]
     mode_idx = get_user_choice("Select Tool Mode:", modes, return_index=True)
     
@@ -363,7 +356,8 @@ def run_sensor_trend_explorer():
     
     # Dispatch
     # Dispatch
-    if mode_idx in [0, 1]: 
+    # Dispatch
+    if mode_idx == 0: 
         print_info("Processing", "Aggregating Trend Data...")
         # 1. Filter
         if inputs["start"]: df = df[df["SendDate"] >= inputs["start"]]
@@ -376,22 +370,16 @@ def run_sensor_trend_explorer():
         
         # 2. Resample
         # Level vs Activity
-        if mode_idx == 0:
+        if inputs["trend_mode"] == "Levels":
             if "CorrectValue" in df.columns: df["ValueUsed"] = df["CorrectValue"].fillna(df["Value"])
             else: df["ValueUsed"] = df["Value"]
             df["ValueUsed"] = pd.to_numeric(df["ValueUsed"], errors='coerce')
             val_col = "ValueUsed"
         else:
              # Activity: 1-min resample first
-             # This is a mini-version of build_matrix logic
              val_col = inputs["feature_type"]
-             # ... (Optimization: Implementing full logic here is verbose. 
-             # Better to use a helper in analysis.py called 'compute_trend_series'?)
              pass
              
-        # Actually, let's keep it simple for this step and just implement Level Trend robustly.
-        # Activity Trend needs the 1-min logic.
-        
         master_index = pd.date_range(inputs["start"] or df["SendDate"].min(), inputs["end"] or df["SendDate"].max(), freq=inputs["period_rule"])
         
         res_dict = {}
@@ -399,7 +387,7 @@ def run_sensor_trend_explorer():
             ndf = df[df["NodeId"] == node]
             if ndf.empty: continue
             
-            if mode_idx == 1:
+            if inputs["trend_mode"] == "Activity Features":
                 # 1-min
                 ts = ndf.set_index("SendDate")["Value"].astype(float).resample("1min").mean()
                 if inputs["feature_type"] == "Rolling STD":
@@ -421,47 +409,7 @@ def run_sensor_trend_explorer():
         res_df.to_csv(f"reports/trend_{inputs['node_name']}.csv")
         print_success("Trend View Complete.")
         
-    elif mode_idx == 2: # Matrix
-        matrix = build_feature_matrix(df, inputs, id_to_label)
-        if matrix is not None:
-             matrix.to_csv("reports/feature_matrix.csv")
-             print_success("Saved reports/feature_matrix.csv")
-             
-    elif mode_idx == 3: # Clustering
-        # 1. Build
-        matrix = build_feature_matrix(df, inputs, id_to_label)
-        if matrix is not None:
-            # 2. Cluster
-            res, k, scores = run_kmeans_clustering(matrix, inputs)
-            res.to_csv("reports/clustered_data.csv")
-            print_success(f"Saved reports/clustered_data.csv (K={k})")
-            
-            # 3. Profile
-            profs = generate_cluster_profiles(res)
-            print(profs)
-
-    elif mode_idx == 6: # Batch
-        print_info("Batch", "Running End-to-End...")
-        # 1. Matrix
-        inputs["preset"] = "Minimal"
-        inputs["validity"] = "Flexible"
-        matrix = build_feature_matrix(df, inputs, id_to_label)
-        
-        # 2. Cluster
-        inputs["manual_k"] = None # Auto
-        res, k, scores = run_kmeans_clustering(matrix, inputs)
-        
-        # 3. Report
-        generate_usage_report(res)
-        
-        # Save
-        res.to_csv("reports/batch_results.csv")
-        print_success("Batch Complete.")
-        
-    elif mode_idx == 7: # Researcher
-        _run_researcher_mode(df, locations, id_to_label, inputs)
-        
-    elif mode_idx == 8: # Analysis Validation
+    elif mode_idx == 1: # Analysis Validation
         from .analysis_validation import AnalysisValidation
         # Ensure config matches class expectation
         av_config = {
@@ -484,3 +432,85 @@ def run_sensor_trend_explorer():
         
         av = AnalysisValidation(av_config)
         av.run()
+
+    elif mode_idx == 2: # Automate Run
+        print_info("Processing", f"Running Automated Analysis for {inputs['param_label']}...")
+        
+        # 1. Filter Time
+        if inputs["start"]: df = df[df["SendDate"] >= inputs["start"]]
+        if inputs["end"]: df = df[df["SendDate"] <= inputs["end"]]
+        
+        # 2. Filter Param
+        # Identify sensor IDs that map to the chosen label
+        target_ids = [sid for sid, lbl in id_to_label.items() if lbl == inputs["label"]]
+        if not target_ids:
+            print_error(f"No sensors found for {inputs['label']}")
+            return
+
+        df = df[df["SensorId"].astype(str).isin(target_ids)]
+        
+        # 3. Pivot & Resample
+        # We want a single chart with lines for each Node
+        # Pivot: Index=Time, Columns=NodeId, Values=Value
+        
+        # Clean numeric
+        if "CorrectValue" in df.columns: df["val"] = df["CorrectValue"].fillna(df["Value"])
+        else: df["val"] = df["Value"]
+        df["val"] = pd.to_numeric(df["val"], errors='coerce')
+        
+        # Pivot Table isn't enough if we need resampling. 
+        # Easier: Resample each node then concat.
+        
+        master_idx = pd.date_range(
+            df["SendDate"].min().floor(inputs["period_rule"]), 
+            df["SendDate"].max().ceil(inputs["period_rule"]), 
+            freq=inputs["period_rule"]
+        )
+        
+        aligned_data = {}
+        processed_nodes = []
+        
+        # Use inputs["target_nodes"] which is ALL for this mode
+        for node in inputs["target_nodes"]:
+            ndf = df[df["NodeId"] == node]
+            if ndf.empty: continue
+            
+            # Resample
+            ts = ndf.set_index("SendDate")["val"].resample(inputs["period_rule"]).agg(inputs["agg_func"])
+            aligned_data[node] = ts.reindex(master_idx)
+            processed_nodes.append(node)
+            
+        if not aligned_data:
+            print_error("No data found for selected parameter and range.")
+            return
+
+        res_df = pd.DataFrame(aligned_data, index=master_idx)
+        
+        # 4. Plot
+        plt.figure(figsize=(12, 6))
+        # Use specific colors if standard rooms
+        color_map = {
+            "TRP1": "#F44336", "TRP2": "#2196F3", "TRP3": "#4CAF50", 
+            "TRP4": "#FFC107", "TRP5": "#9C27B0"
+        }
+        
+        for col in res_df.columns:
+            series = res_df[col].dropna() # Don't plot gaps? Or plot with gaps?
+            # Standard plot handles NaNs by breaking line. That's good.
+            c = color_map.get(col, None) 
+            plt.plot(res_df.index, res_df[col], label=f"{locations.get(col, col)}", color=c, lw=2)
+            plt.fill_between(res_df.index, res_df[col], color=c, alpha=0.1) # Transparent fill
+            
+        plt.title(f"{inputs['param_label']} - Automated Run ({inputs['period_name']})", loc='left', fontsize=14, fontweight='bold')
+        _style_plot(plt.gca())
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        
+        # Save
+        out_dir = f"reports/automated_runs/run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        if not os.path.exists(out_dir): os.makedirs(out_dir)
+        fname = f"{inputs['label']}_comparison.png"
+        path = os.path.join(out_dir, fname)
+        plt.savefig(path)
+        print_success(f"Saved Automated Run chart: {path}")
