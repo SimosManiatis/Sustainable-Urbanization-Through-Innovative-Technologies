@@ -215,6 +215,14 @@ def parse_date_input(prompt):
                 dt = datetime.strptime(val, fmt)
                 return pd.Timestamp(dt).tz_localize('UTC') 
             except ValueError: continue
+        # Try YYYY-MM-DD and set to end of day if requested
+        try:
+             dt = datetime.strptime(val, "%Y-%m-%d")
+             if "End" in prompt:
+                 dt = dt.replace(hour=23, minute=59, second=59)
+             return pd.Timestamp(dt).tz_localize('UTC')
+        except ValueError:
+             pass
         print_error("Invalid format.")
 
 def _get_common_inputs(df, locations):
@@ -286,6 +294,10 @@ def get_full_inputs(mode_idx, df, locations, id_to_label):
         if inputs["k_strategy"] == "Manual":
             inputs["manual_k"] = int(input("Enter K: "))
             
+    # Mode 8: Analysis Validation
+    elif mode_idx == 8:
+        inputs["agg_func"] = get_user_choice("Aggregation Method:", ["mean", "median"])
+            
     return inputs
 
 # --- PLOTTING HELPERS --- (Reusing existing plot logic slightly adapted)
@@ -342,7 +354,8 @@ def run_sensor_trend_explorer():
         "Cluster Review (Not Impl)",
         "Room Usage Reporting (Not Impl)",
         "Batch Run",
-        "Researcher Mode (Scientific Validation)"
+        "Researcher Mode (Scientific Validation)",
+        "Analysis Validation (Strict Pipeline)"
     ]
     mode_idx = get_user_choice("Select Tool Mode:", modes, return_index=True)
     
@@ -447,3 +460,27 @@ def run_sensor_trend_explorer():
         
     elif mode_idx == 7: # Researcher
         _run_researcher_mode(df, locations, id_to_label, inputs)
+        
+    elif mode_idx == 8: # Analysis Validation
+        from .analysis_validation import AnalysisValidation
+        # Ensure config matches class expectation
+        av_config = {
+            "raw_data_dir": "raw_data", # Hardcoded relative or pass from data_loader if exposed
+            # Actually data_loader doesn't expose dir, but we know it
+            # Better: Let's assume we use the constants.
+            "mapping_file": "sensor_mapping.json",
+            "output_dir": "reports/analysis_validation",
+            "run_id": f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            "start_dt": inputs["start"],
+            "end_dt": inputs["end"],
+            "bin_size": inputs["period_rule"],
+            "agg_method": inputs["agg_func"], # mean/median
+            "target_nodes": inputs["target_nodes"]
+        }
+        # Constants patch
+        from .constants import RAW_DATA_DIR, MAPPING_FILE
+        av_config["raw_data_dir"] = RAW_DATA_DIR
+        av_config["mapping_file"] = MAPPING_FILE
+        
+        av = AnalysisValidation(av_config)
+        av.run()

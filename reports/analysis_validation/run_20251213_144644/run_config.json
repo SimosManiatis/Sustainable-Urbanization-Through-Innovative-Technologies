@@ -1,0 +1,67 @@
+{
+    "raw_data_dir": "D:\\T.U\\raw_data",
+    "mapping_file": "d:\\T.U\\Sustainable Urbanization Through Innovative Technologies\\sensor_mapping.json",
+    "output_dir": "reports/analysis_validation",
+    "run_id": "run_20251213_144644",
+    "start_dt": "2025-11-29 00:00:00+00:00",
+    "end_dt": "2025-12-03 00:00:00+00:00",
+    "bin_size": "30min",
+    "agg_method": "median",
+    "target_nodes": [
+        "TRP1",
+        "TRP2",
+        "TRP3",
+        "TRP4",
+        "TRP5"
+    ],
+    "requested_start": "2025-11-29 00:00:00+00:00",
+    "requested_end": "2025-12-03 00:00:00+00:00",
+    "effective_start_clamped": "2025-11-29 00:00:00+00:00",
+    "effective_end_clamped": "2025-12-03 00:00:00+00:00",
+    "timeline_start": "2025-11-29 00:00:00+00:00",
+    "timeline_end": "2025-12-03 00:00:00+00:00",
+    "stats": [
+        {
+            "Room": "TRP1",
+            "Total": 193,
+            "Eligible": 174,
+            "Retained": 174,
+            "Warmup_Excluded": 19
+        },
+        {
+            "Room": "TRP2",
+            "Total": 193,
+            "Eligible": 89,
+            "Retained": 89,
+            "Warmup_Excluded": 104
+        },
+        {
+            "Room": "TRP3",
+            "Total": 193,
+            "Eligible": 140,
+            "Retained": 140,
+            "Warmup_Excluded": 53
+        },
+        {
+            "Room": "TRP4",
+            "Total": 193,
+            "Eligible": 190,
+            "Retained": 190,
+            "Warmup_Excluded": 3
+        },
+        {
+            "Room": "TRP5",
+            "Total": 193,
+            "Eligible": 190,
+            "Retained": 190,
+            "Warmup_Excluded": 3
+        }
+    ],
+    "meta": {
+        "source_file": "sensor_data_10_12_25.csv",
+        "raw_row_count": 3606959,
+        "cleaned_row_count": 159648,
+        "total_bins_timeline": 193,
+        "min_cluster_size": 23
+    }
+}

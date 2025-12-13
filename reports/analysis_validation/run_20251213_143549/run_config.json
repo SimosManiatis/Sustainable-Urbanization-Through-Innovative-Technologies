@@ -1,0 +1,31 @@
+{
+    "raw_data_dir": "D:\\T.U\\raw_data",
+    "mapping_file": "d:\\T.U\\Sustainable Urbanization Through Innovative Technologies\\sensor_mapping.json",
+    "output_dir": "reports/analysis_validation",
+    "run_id": "run_20251213_143549",
+    "start_dt": "2025-11-29 00:00:00+00:00",
+    "end_dt": "2025-12-30 00:00:00+00:00",
+    "bin_size": "15min",
+    "agg_method": "median",
+    "target_nodes": [
+        "TRP1",
+        "TRP2",
+        "TRP3",
+        "TRP4",
+        "TRP5"
+    ],
+    "effective_start": "2025-11-29 00:00:00+00:00",
+    "effective_end": "2025-12-30 00:00:00+00:00",
+    "run_metadata": {
+        "source_file": "sensor_data_10_12_25.csv",
+        "raw_row_count": 3606959,
+        "cleaned_row_count": 455702,
+        "timeline_bins": 2977,
+        "warmup_bins": 1,
+        "matrix_rows_final": 4374,
+        "dropped_nan_features": 27,
+        "min_cluster_size_threshold": 131,
+        "clustering_seed": 42,
+        "selected_k": 2
+    }
+}
