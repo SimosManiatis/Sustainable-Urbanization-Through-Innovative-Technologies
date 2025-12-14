@@ -283,19 +283,7 @@ def get_full_inputs(mode_idx, df, locations, id_to_label):
     elif mode_idx == 1:
         inputs["agg_func"] = get_user_choice("Aggregation Method:", ["mean", "median"])
 
-    # Mode 3: Automate Run
-    elif mode_idx == 2:
-        inputs["agg_func"] = get_user_choice("Aggregation Method:", ["mean", "median"])
-        # Param Selection
-        params = {
-            "Sound Level": "Sound_ave",
-            "Light Level": "Light_ave",
-            "Temperature": "Temperature_ave",
-            "Air Quality": "AirQuality_ave",
-            "Humidity": "Humidity_ave"
-        }
-        inputs["param_label"] = get_user_choice("Select Parameter to Visualize:", list(params.keys()))
-        inputs["label"] = params[inputs["param_label"]] # Map to sensor label
+    return inputs
 
     return inputs
 
@@ -307,7 +295,7 @@ def _style_plot(ax):
     plt.xticks(rotation=0)
     plt.tight_layout()
 
-def plot_trend(df, inputs, locations):
+def plot_trend(df, inputs, locations, output_dir="reports"):
     """Plots whatever is in df (Level or Feature)."""
     plt.figure(figsize=(12, 6))
     colors = ["#F44336", "#2196F3", "#4CAF50", "#FFC107", "#9C27B0"]
@@ -329,8 +317,8 @@ def plot_trend(df, inputs, locations):
     plt.legend(loc='upper right', frameon=False)
     
     # Save
-    if not os.path.exists("reports"): os.makedirs("reports")
-    path = f"reports/trend_{inputs['node_name']}_{inputs.get('label','custom')}.png"
+    if not os.path.exists(output_dir): os.makedirs(output_dir)
+    path = os.path.join(output_dir, f"trend_{inputs['node_name']}_{inputs.get('label','custom')}.png")
     plt.savefig(path)
     print_success(f"Saved plot: {path}")
 
@@ -347,8 +335,7 @@ def run_sensor_trend_explorer():
 
     modes = [
         "Trend Explorer",
-        "Analysis Validation",
-        "Automate Run"
+        "Analysis Validation"
     ]
     mode_idx = get_user_choice("Select Tool Mode:", modes, return_index=True)
     
@@ -405,8 +392,13 @@ def run_sensor_trend_explorer():
             res_dict[node] = binned.reindex(master_index)
             
         res_df = pd.DataFrame(res_dict, index=master_index)
-        plot_trend(res_df, inputs, locations)
-        res_df.to_csv(f"reports/trend_{inputs['node_name']}.csv")
+        
+        # Output Dir
+        out_dir = os.path.join("reports", "trend_explorer", inputs["node_name"])
+        if not os.path.exists(out_dir): os.makedirs(out_dir)
+
+        plot_trend(res_df, inputs, locations, output_dir=out_dir)
+        res_df.to_csv(os.path.join(out_dir, f"trend_{inputs['node_name']}.csv"))
         print_success("Trend View Complete.")
         
     elif mode_idx == 1: # Analysis Validation
@@ -417,7 +409,7 @@ def run_sensor_trend_explorer():
             # Actually data_loader doesn't expose dir, but we know it
             # Better: Let's assume we use the constants.
             "mapping_file": "sensor_mapping.json",
-            "output_dir": "reports/analysis_validation",
+            "output_dir": os.path.join("reports", "analysis_validation", inputs.get("node_name", "Global")),
             "run_id": f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
             "start_dt": inputs["start"],
             "end_dt": inputs["end"],
@@ -433,84 +425,5 @@ def run_sensor_trend_explorer():
         av = AnalysisValidation(av_config)
         av.run()
 
-    elif mode_idx == 2: # Automate Run
-        print_info("Processing", f"Running Automated Analysis for {inputs['param_label']}...")
-        
-        # 1. Filter Time
-        if inputs["start"]: df = df[df["SendDate"] >= inputs["start"]]
-        if inputs["end"]: df = df[df["SendDate"] <= inputs["end"]]
-        
-        # 2. Filter Param
-        # Identify sensor IDs that map to the chosen label
-        target_ids = [sid for sid, lbl in id_to_label.items() if lbl == inputs["label"]]
-        if not target_ids:
-            print_error(f"No sensors found for {inputs['label']}")
-            return
-
-        df = df[df["SensorId"].astype(str).isin(target_ids)]
-        
-        # 3. Pivot & Resample
-        # We want a single chart with lines for each Node
-        # Pivot: Index=Time, Columns=NodeId, Values=Value
-        
-        # Clean numeric
-        if "CorrectValue" in df.columns: df["val"] = df["CorrectValue"].fillna(df["Value"])
-        else: df["val"] = df["Value"]
-        df["val"] = pd.to_numeric(df["val"], errors='coerce')
-        
-        # Pivot Table isn't enough if we need resampling. 
-        # Easier: Resample each node then concat.
-        
-        master_idx = pd.date_range(
-            df["SendDate"].min().floor(inputs["period_rule"]), 
-            df["SendDate"].max().ceil(inputs["period_rule"]), 
-            freq=inputs["period_rule"]
-        )
-        
-        aligned_data = {}
-        processed_nodes = []
-        
-        # Use inputs["target_nodes"] which is ALL for this mode
-        for node in inputs["target_nodes"]:
-            ndf = df[df["NodeId"] == node]
-            if ndf.empty: continue
-            
-            # Resample
-            ts = ndf.set_index("SendDate")["val"].resample(inputs["period_rule"]).agg(inputs["agg_func"])
-            aligned_data[node] = ts.reindex(master_idx)
-            processed_nodes.append(node)
-            
-        if not aligned_data:
-            print_error("No data found for selected parameter and range.")
-            return
-
-        res_df = pd.DataFrame(aligned_data, index=master_idx)
-        
-        # 4. Plot
-        plt.figure(figsize=(12, 6))
-        # Use specific colors if standard rooms
-        color_map = {
-            "TRP1": "#F44336", "TRP2": "#2196F3", "TRP3": "#4CAF50", 
-            "TRP4": "#FFC107", "TRP5": "#9C27B0"
-        }
-        
-        for col in res_df.columns:
-            series = res_df[col].dropna() # Don't plot gaps? Or plot with gaps?
-            # Standard plot handles NaNs by breaking line. That's good.
-            c = color_map.get(col, None) 
-            plt.plot(res_df.index, res_df[col], label=f"{locations.get(col, col)}", color=c, lw=2)
-            plt.fill_between(res_df.index, res_df[col], color=c, alpha=0.1) # Transparent fill
-            
-        plt.title(f"{inputs['param_label']} - Automated Run ({inputs['period_name']})", loc='left', fontsize=14, fontweight='bold')
-        _style_plot(plt.gca())
-        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        
-        # Save
-        out_dir = f"reports/automated_runs/run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        if not os.path.exists(out_dir): os.makedirs(out_dir)
-        fname = f"{inputs['label']}_comparison.png"
-        path = os.path.join(out_dir, fname)
-        plt.savefig(path)
-        print_success(f"Saved Automated Run chart: {path}")
+        av = AnalysisValidation(av_config)
+        av.run()
