@@ -9,6 +9,127 @@ def get_unique_sensors(df, sensor_name_col):
         return sorted(df[sensor_name_col].astype(str).unique())
     return []
 
+def get_user_choice(prompt, options, return_index=False):
+    """Helper to get user choice."""
+    print(f"\n{Colors.HEADER}{prompt}{Colors.ENDC}")
+    if isinstance(options, list):
+        for i, opt in enumerate(options): print(f"{i+1}. {opt}")
+        while True:
+            try:
+                val = input(f"{Colors.CYAN}Select (1-{len(options)}): {Colors.ENDC}").strip()
+                idx = int(val) - 1
+                if 0 <= idx < len(options): return idx if return_index else options[idx]
+                print(f"{Colors.FAIL}Invalid selection.{Colors.ENDC}")
+            except ValueError: print(f"{Colors.FAIL}NaN{Colors.ENDC}")
+    elif isinstance(options, dict):
+        keys = list(options.keys())
+        for i, key in enumerate(keys): print(f"{i+1}. {key}")
+        while True:
+            try:
+                val = input(f"{Colors.CYAN}Select (1-{len(keys)}): {Colors.ENDC}").strip()
+                idx = int(val) - 1
+                if 0 <= idx < len(keys): return options[keys[idx]]
+                print(f"{Colors.FAIL}Invalid selection.{Colors.ENDC}")
+            except ValueError: print(f"{Colors.FAIL}NaN{Colors.ENDC}")
+
+def parse_date_input(prompt):
+    print(f"\n{Colors.HEADER}{prompt}{Colors.ENDC}")
+    while True:
+        val = input(f"{Colors.CYAN}Enter Date (YYYY-MM-DD [HH:MM]) or press Enter to skip: {Colors.ENDC}").strip()
+        if not val: return None
+        for fmt in ["%Y-%m-%d %H:%M", "%Y-%m-%d"]:
+            try:
+                dt = datetime.strptime(val, fmt)
+                return pd.Timestamp(dt).tz_localize('UTC') 
+            except ValueError: continue
+        # Try YYYY-MM-DD and set to end of day if requested
+        try:
+             dt = datetime.strptime(val, "%Y-%m-%d")
+             if "End" in prompt:
+                 dt = dt.replace(hour=23, minute=59, second=59)
+             return pd.Timestamp(dt).tz_localize('UTC')
+        except ValueError:
+             pass
+        print(f"{Colors.FAIL}Invalid format.{Colors.ENDC}")
+
+def get_common_inputs(df, locations):
+    inputs = {}
+    print_info("Scope", "Select Room Scope")
+    scope = get_user_choice("Scope:", ["Single room", "Compare all rooms"])
+    inputs["mode"] = scope
+    
+    if scope == "Single room":
+        sorted_locs = sorted(locations.items())
+        loc_options = [f"{lid} - {name}" for lid, name in sorted_locs]
+        idx = get_user_choice("Select Room:", loc_options, return_index=True)
+        inputs["target_nodes"] = [sorted_locs[idx][0]]
+        inputs["node_name"] = sorted_locs[idx][0]
+    else:
+        inputs["target_nodes"] = ["TRP1", "TRP2", "TRP3", "TRP4", "TRP5"]
+        inputs["node_name"] = "ALL"
+        
+    print_info("Time", f"Available: {df['SendDate'].min()} to {df['SendDate'].max()}")
+    inputs["start"] = parse_date_input("Start Date (Optional)")
+    inputs["end"] = parse_date_input("End Date (Optional)")
+    
+    periods = {"Quarter Hour (15min)": "15min", "Half Hour (30min)": "30min", "Hour (1h)": "1h", "Day (1D)": "1D"}
+    pname = get_user_choice("Analysis Period:", list(periods.keys()))
+    inputs["period_name"] = pname
+    inputs["period_rule"] = periods[pname]
+    
+    return inputs
+
+def get_clean_csv_inputs(df, locations, id_to_label):
+    """Gets inputs for the Clean CSV Export mode."""
+    inputs = get_common_inputs(df, locations)
+    
+    # Parameter Selection
+    print_header("Parameter Selection")
+    
+    # Filter out unwanted columns
+    all_measurements = sorted(list(set(id_to_label.values())))
+    excluded_keywords = ["IPAddress", "Mac Address", "Iamalive", "Label", "Air Quality_max", "Air Quality_min"]
+    unique_measurements = [
+        m for m in all_measurements 
+        if not any(ex in m for ex in excluded_keywords)
+    ]
+    
+    print("Available Parameters:")
+    for i, m in enumerate(unique_measurements):
+        print(f"{i+1}. {m}")
+    
+    print("\nEnter comma-separated numbers for multiple parameters (e.g., '1, 2, 5') or 'all' for everything.")
+    while True:
+        choice = input(f"{Colors.CYAN}Select Parameters: {Colors.ENDC}").strip().lower()
+        if choice == 'all':
+            inputs["parameters"] = unique_measurements
+            break
+        
+        try:
+            indices = [int(x.strip()) - 1 for x in choice.split(',')]
+            selected_params = []
+            for idx in indices:
+                if 0 <= idx < len(unique_measurements):
+                    selected_params.append(unique_measurements[idx])
+            
+            if selected_params:
+                inputs["parameters"] = selected_params
+                break
+            else:
+                print(f"{Colors.FAIL}No valid parameters selected. Try again.{Colors.ENDC}")
+        except ValueError:
+            print(f"{Colors.FAIL}Invalid input. Please enter numbers separated by commas.{Colors.ENDC}")
+            
+    # Empty Value Handling
+    print_header("Empty Value Handling")
+    empty_opts = ["Keep All (Strict Grid)", "Drop Empty Rows", "Forward Fill"] 
+    # Forward Fill might interpret as "Fill with previous known value". 
+    # Strict Grid keeps NaNs. Drop Empty Rows removes timestamps where ALL selected params are NaN? Or ANY? 
+    # Usually "Drop Empty Rows" means "if I have no data for this timestamp for this node".
+    inputs["empty_handling"] = get_user_choice("Select Strategy:", empty_opts) 
+            
+    return inputs
+
 def select_date_drilldown(df):
     """
     Interactive Year -> Month -> Day selection.

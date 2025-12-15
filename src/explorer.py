@@ -5,6 +5,7 @@ import os
 import numpy as np
 from datetime import datetime
 from .utils import print_header, print_info, print_error, print_success, print_warning, Colors
+from . import ui
 from .data_loader import load_raw_data
 from .analysis import (
     build_feature_matrix, run_kmeans_clustering, generate_cluster_profiles, 
@@ -181,107 +182,38 @@ def _run_researcher_mode(df, locations, id_to_label, inputs=None):
         
     print_success("Researcher Pipeline Complete. Check reports/researcher/")
 
-# --- HELPERS ---
-def get_user_choice(prompt, options, return_index=False):
-    """Helper to get user choice."""
-    print(f"\n{Colors.HEADER}{prompt}{Colors.ENDC}")
-    if isinstance(options, list):
-        for i, opt in enumerate(options): print(f"{i+1}. {opt}")
-        while True:
-            try:
-                val = input(f"{Colors.CYAN}Select (1-{len(options)}): {Colors.ENDC}").strip()
-                idx = int(val) - 1
-                if 0 <= idx < len(options): return idx if return_index else options[idx]
-                print_error("Invalid selection.")
-            except ValueError: print_error("NaN")
-    elif isinstance(options, dict):
-        keys = list(options.keys())
-        for i, key in enumerate(keys): print(f"{i+1}. {key}")
-        while True:
-            try:
-                val = input(f"{Colors.CYAN}Select (1-{len(keys)}): {Colors.ENDC}").strip()
-                idx = int(val) - 1
-                if 0 <= idx < len(keys): return options[keys[idx]]
-                print_error("Invalid selection.")
-            except ValueError: print_error("NaN")
 
-def parse_date_input(prompt):
-    print(f"\n{Colors.HEADER}{prompt}{Colors.ENDC}")
-    while True:
-        val = input(f"{Colors.CYAN}Enter Date (YYYY-MM-DD [HH:MM]) or press Enter to skip: {Colors.ENDC}").strip()
-        if not val: return None
-        for fmt in ["%Y-%m-%d %H:%M", "%Y-%m-%d"]:
-            try:
-                dt = datetime.strptime(val, fmt)
-                return pd.Timestamp(dt).tz_localize('UTC') 
-            except ValueError: continue
-        # Try YYYY-MM-DD and set to end of day if requested
-        try:
-             dt = datetime.strptime(val, "%Y-%m-%d")
-             if "End" in prompt:
-                 dt = dt.replace(hour=23, minute=59, second=59)
-             return pd.Timestamp(dt).tz_localize('UTC')
-        except ValueError:
-             pass
-        print_error("Invalid format.")
-
-def _get_common_inputs(df, locations):
-    inputs = {}
-    print_info("Scope", "Select Room Scope")
-    scope = get_user_choice("Scope:", ["Single room", "Compare all rooms"])
-    inputs["mode"] = scope
-    
-    if scope == "Single room":
-        sorted_locs = sorted(locations.items())
-        loc_options = [f"{lid} - {name}" for lid, name in sorted_locs]
-        idx = get_user_choice("Select Room:", loc_options, return_index=True)
-        inputs["target_nodes"] = [sorted_locs[idx][0]]
-        inputs["node_name"] = sorted_locs[idx][0]
-    else:
-        inputs["target_nodes"] = ["TRP1", "TRP2", "TRP3", "TRP4", "TRP5"]
-        inputs["node_name"] = "ALL"
-        
-    print_info("Time", f"Available: {df['SendDate'].min()} to {df['SendDate'].max()}")
-    inputs["start"] = parse_date_input("Start Date (Optional)")
-    inputs["end"] = parse_date_input("End Date (Optional)")
-    
-    periods = {"Quarter Hour (15min)": "15min", "Half Hour (30min)": "30min", "Hour (1h)": "1h", "Day (1D)": "1D"}
-    pname = get_user_choice("Analysis Period:", list(periods.keys()))
-    inputs["period_name"] = pname
-    inputs["period_rule"] = periods[pname]
-    
-    return inputs
 
 def get_full_inputs(mode_idx, df, locations, id_to_label):
     """Dispatches input collection based on mode."""
-    inputs = _get_common_inputs(df, locations)
+    inputs = ui.get_common_inputs(df, locations)
     inputs["mode_idx"] = mode_idx
     
     # Mode 1: Trend Explorer
     if mode_idx == 0:
-        view_type = get_user_choice("Select View Type:", ["Levels", "Activity Features"])
+        view_type = ui.get_user_choice("Select View Type:", ["Levels", "Activity Features"])
         inputs["trend_mode"] = view_type
         
         measurements = sorted(list(set(id_to_label.values())))
         
         if view_type == "Levels":
-            inputs["label"] = get_user_choice("Select Measurement:", measurements)
+            inputs["label"] = ui.get_user_choice("Select Measurement:", measurements)
             dtypes = {"Mean": "mean", "Min": "min", "Max": "max", "First": "first"}
-            inputs["dtype_name"] = get_user_choice("Data Type:", list(dtypes.keys()))
+            inputs["dtype_name"] = ui.get_user_choice("Data Type:", list(dtypes.keys()))
             inputs["agg_func"] = dtypes[inputs["dtype_name"]]
         else: # Activity
-            inputs["label"] = get_user_choice("Base Measurement:", measurements)
-            inputs["feature_type"] = get_user_choice("Feature:", ["Rolling STD", "Delta"])
+            inputs["label"] = ui.get_user_choice("Base Measurement:", measurements)
+            inputs["feature_type"] = ui.get_user_choice("Feature:", ["Rolling STD", "Delta"])
             if inputs["feature_type"] == "Rolling STD":
-                inputs["window"] = float(get_user_choice("Window (min):", ["1", "2.5", "5", "10"]))
+                inputs["window"] = float(ui.get_user_choice("Window (min):", ["1", "2.5", "5", "10"]))
             else:
-                inputs["window"] = float(get_user_choice("Window (min):", ["2", "5", "15"]))
+                inputs["window"] = float(ui.get_user_choice("Window (min):", ["2", "5", "15"]))
             inputs["agg_func"] = "mean"
             inputs["dtype_name"] = f"{inputs['feature_type']} {inputs['window']}"
 
     # Mode 2: Analysis Validation
     elif mode_idx == 1:
-        inputs["agg_func"] = get_user_choice("Aggregation Method:", ["mean", "median"])
+        inputs["agg_func"] = ui.get_user_choice("Aggregation Method:", ["mean", "median"])
 
     return inputs
 
@@ -335,14 +267,16 @@ def run_sensor_trend_explorer():
 
     modes = [
         "Trend Explorer",
-        "Analysis Validation"
+        "Analysis Validation",
+        "Clean CSV Exporter"
     ]
-    mode_idx = get_user_choice("Select Tool Mode:", modes, return_index=True)
+    mode_idx = ui.get_user_choice("Select Tool Mode:", modes, return_index=True)
     
-    inputs = get_full_inputs(mode_idx, df, locations, id_to_label)
+    if mode_idx == 2:
+        inputs = ui.get_clean_csv_inputs(df, locations, id_to_label)
+    else:
+        inputs = get_full_inputs(mode_idx, df, locations, id_to_label)
     
-    # Dispatch
-    # Dispatch
     # Dispatch
     if mode_idx == 0: 
         print_info("Processing", "Aggregating Trend Data...")
@@ -423,7 +357,88 @@ def run_sensor_trend_explorer():
         av_config["mapping_file"] = MAPPING_FILE
         
         av = AnalysisValidation(av_config)
-        av.run()
+        av.run() 
 
-        av = AnalysisValidation(av_config)
-        av.run()
+    elif mode_idx == 2: # Clean CSV Exporter
+        print_info("Processing", "Generating Clean CSV...")
+        
+        # Filter Time
+        df_filtered = df.copy()
+        if inputs["start"]: df_filtered = df_filtered[df_filtered["SendDate"] >= inputs["start"]]
+        if inputs["end"]: df_filtered = df_filtered[df_filtered["SendDate"] <= inputs["end"]]
+        
+        # Filter Nodes
+        df_filtered = df_filtered[df_filtered["NodeId"].isin(inputs["target_nodes"])]
+        
+        # Master Index
+        start = inputs["start"] if inputs["start"] is not None else df_filtered["SendDate"].min()
+        end = inputs["end"] if inputs["end"] is not None else df_filtered["SendDate"].max()
+        master_index = pd.date_range(start, end, freq=inputs["period_rule"])
+        
+        frames = []
+        for node in inputs["target_nodes"]:
+            node_df = df_filtered[df_filtered["NodeId"] == node]
+            if node_df.empty: continue
+            
+            node_res = pd.DataFrame(index=master_index)
+            
+            for param in inputs["parameters"]:
+                target_ids = [sid for sid, lbl in id_to_label.items() if lbl == param]
+                if not target_ids: 
+                    node_res[param] = np.nan
+                    continue
+                
+                p_df = node_df[node_df["SensorId"].astype(str).isin(target_ids)]
+                if p_df.empty:
+                    node_res[param] = np.nan
+                    continue
+
+                if "CorrectValue" in p_df.columns: 
+                    vals = p_df["CorrectValue"].fillna(p_df["Value"])
+                else: 
+                    vals = p_df["Value"]
+                vals = pd.to_numeric(vals, errors='coerce')
+                
+                # Group by time (handle duplicates in same timestamp if any)
+                # Resample
+                resampled = vals.groupby(p_df["SendDate"]).mean().resample(inputs["period_rule"]).mean()
+                node_res[param] = resampled.round(3) # Rounding
+                
+            node_res["NodeId"] = node
+            node_res["Location"] = locations.get(node, "")
+            
+            # Application of Empty Value Handling (PER NODE)
+            # Strategy: Apply to the features only, but here we have just built it.
+            # If "Drop Empty Rows", we check if ALL parameter columns are NaN? 
+            # Or if "Forward Fill", do we ffill?
+            
+            # Actually, "Forward Fill" works best on continuous time series.
+            # "Drop Empty" works best on final rows.
+            
+            param_cols = [p for p in inputs["parameters"] if p in node_res.columns]
+            
+            if inputs.get("empty_handling") == "Forward Fill":
+                 node_res[param_cols] = node_res[param_cols].ffill()
+                 # Round again just in case? No need.
+                 
+            if inputs.get("empty_handling") == "Drop Empty Rows":
+                 node_res = node_res.dropna(how='all', subset=param_cols)
+            
+            frames.append(node_res)
+            
+        if frames:
+            final_df = pd.concat(frames)
+            # Re-apply Rounding to be safe
+            final_df = final_df.round(3)
+            
+            cols = ["NodeId", "Location"] + [p for p in inputs["parameters"] if p in final_df.columns]
+            final_df = final_df[cols]
+            
+            out_dir = os.path.join("reports", "clean_export")
+            if not os.path.exists(out_dir): os.makedirs(out_dir)
+            fname = f"export_{inputs['node_name']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            fpath = os.path.join(out_dir, fname)
+            final_df.to_csv(fpath)
+            print_success(f"Saved Clean CSV to {fpath}")
+        else:
+            print_warning("No data found for selected criteria.")
